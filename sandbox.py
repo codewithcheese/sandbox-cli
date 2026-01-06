@@ -112,6 +112,17 @@ def git_worktree_remove(path: Path) -> bool:
     return result.returncode == 0
 
 
+def copy_env_files(src: Path, dest: Path) -> list[str]:
+    """Copy .env* files from src to dest directory."""
+    import shutil
+    copied = []
+    for env_file in src.glob(".env*"):
+        if env_file.is_file():
+            shutil.copy2(env_file, dest / env_file.name)
+            copied.append(env_file.name)
+    return copied
+
+
 def build_template_if_exists(repo_root: Path) -> str | None:
     """Build custom template if Dockerfile.sandbox exists."""
     dockerfile = repo_root / "Dockerfile.sandbox"
@@ -137,6 +148,22 @@ def get_gh_token() -> str:
     return ""
 
 
+def find_available_ports(count: int = 3, start: int = 49152, end: int = 65535) -> list[int]:
+    """Find available ports in the dynamic/private port range."""
+    import socket
+    ports = []
+    for port in range(start, end):
+        if len(ports) >= count:
+            break
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(("", port))
+                ports.append(port)
+        except OSError:
+            continue
+    return ports
+
+
 def container_exists(name: str) -> bool:
     """Check if a docker container exists."""
     result = run(["docker", "container", "inspect", name])
@@ -158,6 +185,9 @@ def run_sandbox(name: str, repo_name: str, main_git: Path, worktree_path: Path, 
     claude_cmd = ["claude", "--dangerously-skip-permissions"]
     if resume:
         claude_cmd.append("--continue")
+
+    # Will be set after ports are determined for new containers
+    ports_prompt = None
 
     # Check if container already exists
     if container_exists(container_name):
@@ -182,9 +212,19 @@ def run_sandbox(name: str, repo_name: str, main_git: Path, worktree_path: Path, 
             "-e", "FORCE_COLOR=1",
             "-e", "COLORTERM=truecolor",
             "-v", f"{home}/.ssh:/home/agent/.ssh:ro",
+        ]
+        # Add dynamic port mappings
+        ports = find_available_ports(3)
+        for port in ports:
+            cmd_parts.extend(["-p", f"{port}:{port}"])
+        cmd_parts.extend([
+            "-e", f"SANDBOX_PORTS={','.join(map(str, ports))}",
             "-w", str(worktree_path),
             image,
-        ] + claude_cmd
+        ])
+        cmd_parts.extend(claude_cmd)
+        ports_prompt = f"You are running in a sandbox. Available ports for dev servers: {', '.join(map(str, ports))}. When starting dev servers, use --port {ports[0]} --host 0.0.0.0 (host binding required for port forwarding)."
+        cmd_parts.extend(["--append-system-prompt", f"'{ports_prompt}'"])
 
     # Output for shell wrapper: CD and EXEC directives
     print(f"__SANDBOX_CD__:{worktree_path}")
@@ -247,6 +287,10 @@ def start(name):
             click.echo(f"Failed to create worktree for branch: {name}", err=True)
             sys.exit(1)
 
+        copied = copy_env_files(repo_root, worktree_path)
+        if copied:
+            click.echo(f"Copied: {', '.join(copied)}", err=True)
+
         click.echo(f"Created sandbox from local branch: {name}", err=True)
         run_sandbox(sname, repo_name, main_git, worktree_path, template=template)
     elif remote_branch_exists(name):
@@ -258,6 +302,10 @@ def start(name):
             click.echo(f"Failed to create worktree for remote branch: {name}", err=True)
             sys.exit(1)
 
+        copied = copy_env_files(repo_root, worktree_path)
+        if copied:
+            click.echo(f"Copied: {', '.join(copied)}", err=True)
+
         click.echo(f"Created sandbox from remote branch: {name}", err=True)
         run_sandbox(sname, repo_name, main_git, worktree_path, template=template)
     else:
@@ -268,6 +316,10 @@ def start(name):
         if not git_worktree_add(worktree_path, branch_name, new_branch=True):
             click.echo(f"Failed to create worktree", err=True)
             sys.exit(1)
+
+        copied = copy_env_files(repo_root, worktree_path)
+        if copied:
+            click.echo(f"Copied: {', '.join(copied)}", err=True)
 
         click.echo(f"Created sandbox: {sname}", err=True)
         run_sandbox(sname, repo_name, main_git, worktree_path, template=template)
@@ -329,6 +381,59 @@ def rm(name):
     if not removed_container and not removed_worktree:
         click.echo(f"Nothing found to remove for: {sname}", err=True)
         sys.exit(1)
+
+
+@cli.command()
+@click.argument("name")
+def ports(name):
+    """Show available ports for a sandbox."""
+    repo_root = get_repo_root()
+    if not repo_root:
+        click.echo("Not in a git repository", err=True)
+        sys.exit(1)
+
+    sname = safe_name(name)
+    repo_name = repo_root.name
+    container_name = f"sandbox-{repo_name}-{sname}"
+
+    if not container_exists(container_name):
+        click.echo(f"Sandbox not found: {sname}", err=True)
+        sys.exit(1)
+
+    # Get SANDBOX_PORTS env var from container
+    result = run(["docker", "inspect", "-f", "{{range .Config.Env}}{{println .}}{{end}}", container_name])
+    if result.returncode != 0:
+        click.echo("Failed to inspect container", err=True)
+        sys.exit(1)
+
+    ports = None
+    for line in result.stdout.strip().split("\n"):
+        if line.startswith("SANDBOX_PORTS="):
+            ports = line.split("=", 1)[1]
+            break
+
+    if not ports:
+        click.echo("No ports configured")
+        return
+
+    # Check which ports are actively listening
+    listen_result = run(["docker", "exec", container_name, "ss", "-tlnH"])
+    listening = set()
+    if listen_result.returncode == 0:
+        for line in listen_result.stdout.strip().split("\n"):
+            # Format: LISTEN 0 128 *:49152 *:*
+            parts = line.split()
+            if len(parts) >= 4:
+                addr = parts[3]
+                if ":" in addr:
+                    port = addr.rsplit(":", 1)[-1]
+                    if port.isdigit():
+                        listening.add(port)
+
+    click.echo(f"Ports for {sname}:")
+    for port in ports.split(","):
+        status = " (active)" if port in listening else ""
+        click.echo(f"  http://localhost:{port}{status}")
 
 
 @cli.command()
