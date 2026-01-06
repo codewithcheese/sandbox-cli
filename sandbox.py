@@ -277,10 +277,13 @@ def run_sandbox(name: str, repo_name: str, main_git: Path, worktree_path: Path, 
     print(f"__SANDBOX_REPO__:{repo_name}")
 
 
-@click.group()
-def cli():
+@click.group(invoke_without_command=True)
+@click.pass_context
+def cli(ctx):
     """Docker Sandbox CLI - Manage sandboxed Claude Code environments."""
-    pass
+    if ctx.invoked_subcommand is None:
+        # No subcommand given, invoke start with generated name
+        ctx.invoke(start)
 
 
 def branch_exists(branch: str) -> bool:
