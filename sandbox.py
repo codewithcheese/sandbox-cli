@@ -434,6 +434,12 @@ def start(name):
         run_sandbox(sname, repo_name, main_git, worktree_path, template=template)
     else:
         # New sandbox with new branch
+        # Pull latest changes before creating branch
+        click.echo("Pulling latest changes...", err=True)
+        pull_result = run(["git", "-C", str(repo_root), "pull", "--ff-only"], capture=False)
+        if pull_result.returncode != 0:
+            click.echo("Warning: Could not pull latest changes", err=True)
+
         template = build_template_if_exists(repo_root)
         branch_name = f"task/{name}"
 
