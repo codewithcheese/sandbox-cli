@@ -106,9 +106,12 @@ def git_worktree_add(path: Path, branch: str, new_branch: bool = False) -> bool:
     return result.returncode == 0
 
 
-def git_worktree_remove(path: Path) -> bool:
+def git_worktree_remove(path: Path, force: bool = False) -> bool:
     """Remove a git worktree."""
-    result = run(["git", "worktree", "remove", str(path)])
+    cmd = ["git", "worktree", "remove", str(path)]
+    if force:
+        cmd.append("--force")
+    result = run(cmd)
     return result.returncode == 0
 
 
@@ -594,8 +597,16 @@ def post_exit(name, repo_name):
     if not container_exists(container_name):
         return
 
+    # Check for uncommitted changes in worktree
+    has_uncommitted = False
+    if worktree_path and worktree_path.exists():
+        result = run(["git", "-C", str(worktree_path), "status", "--porcelain"])
+        has_uncommitted = bool(result.stdout.strip())
+
     click.echo("", err=True)  # Blank line after Claude exits
-    if not click.confirm("Cleanup sandbox?", default=True, err=True):
+    if has_uncommitted:
+        click.echo("⚠️  Warning: There are uncommitted changes in this sandbox!", err=True)
+    if not click.confirm("Cleanup sandbox?", default=not has_uncommitted, err=True):
         click.echo("Sandbox kept for later.", err=True)
         return
 
@@ -608,12 +619,13 @@ def post_exit(name, repo_name):
                 break
 
     docker_container_rm(container_name)
+    worktree_removed = False
     if worktree_path:
-        git_worktree_remove(worktree_path)
+        worktree_removed = git_worktree_remove(worktree_path, force=has_uncommitted)
     click.echo(f"Removed sandbox: {sname}", err=True)
 
-    # Offer to delete branch (run from main repo, not worktree)
-    if branch_name and click.confirm(f"Delete branch '{branch_name}'?", default=False, err=True):
+    # Offer to delete branch (only if worktree was removed)
+    if branch_name and worktree_removed and click.confirm(f"Delete branch '{branch_name}'?", default=False, err=True):
         if click.confirm("Confirm delete branch?", default=False, err=True):
             # Use -C to run from main repo directory
             main_repo = repo_root.parent / repo_name if repo_root else None
