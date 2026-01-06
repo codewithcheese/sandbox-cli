@@ -16,7 +16,7 @@ fi
 # Output JSON to prompt Claude to commit
 cat << 'EOF'
 {
-  "continue": true,
-  "systemMessage": "There are uncommitted changes in the repository. Please run `git status` to review, and if the code is ready, commit and push the changes."
+  "decision": "block",
+  "reason": "There are uncommitted changes in the repository. Please run `git status` to review, and if the code is ready, commit and push the changes."
 }
 EOF
