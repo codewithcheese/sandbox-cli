@@ -158,21 +158,22 @@ def ensure_default_image() -> str:
     return image_name
 
 
-def build_template_if_exists(repo_root: Path) -> str | None:
+def build_template_if_exists(repo_root: Path) -> str:
     """Build custom template if Dockerfile.sandbox exists, otherwise use default."""
     dockerfile = repo_root / "Dockerfile.sandbox"
     if not dockerfile.exists():
         return ensure_default_image()
 
     image_name = f"sandbox-template:{repo_root.name}"
-    click.echo("Building project template...")
+    click.echo("Building project template...", err=True)
     result = run(
         ["docker", "build", "-t", image_name, "-f", str(dockerfile), str(repo_root)],
         capture=False,
     )
-    if result.returncode == 0:
-        return image_name
-    return None
+    if result.returncode != 0:
+        click.echo("Failed to build project template", err=True)
+        sys.exit(1)
+    return image_name
 
 
 def get_gh_token() -> str:
