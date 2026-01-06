@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Docker Sandbox CLI - Manage sandboxed Claude Code environments with git worktrees."""
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -257,6 +258,11 @@ def run_sandbox(name: str, repo_name: str, main_git: Path, worktree_path: Path, 
         cmd_parts.extend(claude_cmd)
         ports_prompt = f"You are running in a sandbox. Available ports for dev servers: {', '.join(map(str, ports))}. When starting dev servers, use --port {ports[0]} --host 0.0.0.0 (host binding required for port forwarding)."
         cmd_parts.extend(["--append-system-prompt", f"'{ports_prompt}'"])
+
+    # Wrap with vt (VibeTunnel) if available and not already in vt session
+    vt_check = run(["which", "vt"])
+    if vt_check.returncode == 0 and not os.environ.get("VIBETUNNEL_SESSION_ID"):
+        cmd_parts = ["vt"] + cmd_parts
 
     # Output for shell wrapper: CD and EXEC directives
     print(f"__SANDBOX_CD__:{worktree_path}")
