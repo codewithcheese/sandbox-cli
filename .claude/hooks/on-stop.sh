@@ -7,7 +7,9 @@ if ! git rev-parse --git-dir > /dev/null 2>&1; then
 fi
 
 # Check if there are uncommitted changes (staged or unstaged)
-if git diff --quiet && git diff --cached --quiet && [ -z "$(git ls-files --others --exclude-standard)" ]; then
+# Exclude .claude/ from untracked files (sandbox-managed)
+untracked=$(git ls-files --others --exclude-standard | grep -v '^\.claude/')
+if git diff --quiet && git diff --cached --quiet && [ -z "$untracked" ]; then
   exit 0  # No changes
 fi
 
