@@ -32,8 +32,8 @@ WORKDIR /home/agent
 # Install Playwright browsers
 RUN npx playwright install
 
-# Configure pnpm store location
-ENV PNPM_STORE_DIR=/pnpm-store
+# Configure pnpm store location via .npmrc
+RUN echo "store-dir=/pnpm-store" >> ~/.npmrc
 
 # Python: ensure pip uses user site-packages
 ENV PIP_USER=1
