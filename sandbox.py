@@ -261,6 +261,8 @@ def run_sandbox(name: str, repo_name: str, main_git: Path, worktree_path: Path, 
     # Output for shell wrapper: CD and EXEC directives
     print(f"__SANDBOX_CD__:{worktree_path}")
     print(f"__SANDBOX_EXEC__:{' '.join(cmd_parts)}")
+    print(f"__SANDBOX_NAME__:{name}")
+    print(f"__SANDBOX_REPO__:{repo_name}")
 
 
 @click.group()
@@ -303,9 +305,12 @@ def start(name):
     main_git = get_main_git_dir(repo_root)
 
     if worktree_path.exists() and sandbox_exists(repo_name, sname):
-        # Existing sandbox - resume
-        click.echo(f"Resuming sandbox: {sname}", err=True)
-        run_sandbox(sname, repo_name, main_git, worktree_path, resume=True)
+        # Existing sandbox - recreate container
+        container_name = f"sandbox-{repo_name}-{sname}"
+        docker_container_rm(container_name)
+        click.echo(f"Recreating sandbox: {sname}", err=True)
+        template = build_template_if_exists(repo_root)
+        run_sandbox(sname, repo_name, main_git, worktree_path, template=template)
     elif worktree_path.exists():
         # Worktree exists but no sandbox - start fresh
         template = build_template_if_exists(repo_root)
@@ -466,6 +471,54 @@ def ports(name):
     for port in ports.split(","):
         status = " (active)" if port in listening else ""
         click.echo(f"  http://localhost:{port}{status}")
+
+
+@cli.command("post-exit")
+@click.argument("name")
+@click.argument("repo_name")
+def post_exit(name, repo_name):
+    """Cleanup prompt after exiting a sandbox."""
+    sname = safe_name(name)
+    container_name = f"sandbox-{repo_name}-{sname}"
+
+    # Get repo root for worktree operations
+    repo_root = get_repo_root()
+    if repo_root:
+        # If in worktree, get main repo root
+        if "__" in repo_root.name:
+            repo_root = repo_root.parent / repo_name
+    worktree_path = get_worktree_path(repo_root, sname) if repo_root else None
+
+    # Only prompt if sandbox still exists
+    if not container_exists(container_name):
+        return
+
+    click.echo("", err=True)  # Blank line after Claude exits
+    if not click.confirm("Cleanup sandbox?", default=True, err=True):
+        click.echo("Sandbox kept for later.", err=True)
+        return
+
+    # Get branch name before removing worktree
+    branch_name = None
+    if worktree_path:
+        for wt in git_worktree_list():
+            if wt.get("path") == str(worktree_path):
+                branch_name = wt.get("branch", "").replace("refs/heads/", "")
+                break
+
+    docker_container_rm(container_name)
+    if worktree_path:
+        git_worktree_remove(worktree_path)
+    click.echo(f"Removed sandbox: {sname}", err=True)
+
+    # Offer to delete branch
+    if branch_name and click.confirm(f"Delete branch '{branch_name}'?", default=False, err=True):
+        if click.confirm("Confirm delete branch?", default=False, err=True):
+            result = run(["git", "branch", "-D", branch_name])
+            if result.returncode == 0:
+                click.echo(f"Deleted branch: {branch_name}", err=True)
+            else:
+                click.echo(f"Failed to delete branch", err=True)
 
 
 @cli.command()
