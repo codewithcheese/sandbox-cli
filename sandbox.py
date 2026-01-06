@@ -492,6 +492,13 @@ def rm(name):
     worktree_path = get_worktree_path(repo_root, sname)
     container_name = f"sandbox-{repo_name}-{sname}"
 
+    # Get branch name before removing worktree
+    branch_name = None
+    for wt in git_worktree_list():
+        if wt.get("path") == str(worktree_path):
+            branch_name = wt.get("branch", "").replace("refs/heads/", "")
+            break
+
     removed_container = docker_container_rm(container_name)
     removed_worktree = git_worktree_remove(worktree_path)
 
@@ -503,6 +510,15 @@ def rm(name):
     if not removed_container and not removed_worktree:
         click.echo(f"Nothing found to remove for: {sname}", err=True)
         sys.exit(1)
+
+    # Offer to delete branch
+    if branch_name and removed_worktree:
+        if click.confirm(f"Delete branch '{branch_name}'?", default=False):
+            result = run(["git", "branch", "-D", branch_name])
+            if result.returncode == 0:
+                click.echo(f"Deleted branch: {branch_name}")
+            else:
+                click.echo(f"Failed to delete branch: {result.stderr}", err=True)
 
 
 @cli.command()
