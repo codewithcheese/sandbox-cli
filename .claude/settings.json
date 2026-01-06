@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": ".claude/hooks/on-stop.sh"
+            "command": "/opt/sandbox-claude/hooks/on-stop.sh"
           }
         ]
       }
@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": ".claude/hooks/post-push.sh"
+            "command": "/opt/sandbox-claude/hooks/post-push.sh"
           }
         ]
       }
