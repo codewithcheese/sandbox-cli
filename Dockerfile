@@ -5,7 +5,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-pip python3-venv \
     git curl wget vim build-essential \
     openssh-client iproute2 \
-    gnupg \
+    gnupg jq \
     && rm -rf /var/lib/apt/lists/*
 
 # Install GitHub CLI
@@ -34,6 +34,9 @@ RUN npx playwright install
 
 # Configure pnpm store location via .npmrc
 RUN echo "store-dir=/pnpm-store" >> ~/.npmrc
+
+# Copy sandbox scripts
+COPY --chown=agent:agent scripts/ /home/agent/.local/bin/
 
 # Python: ensure pip uses user site-packages
 ENV PIP_USER=1
