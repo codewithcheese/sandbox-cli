@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Docker Sandbox CLI - Manage sandboxed Claude Code environments with git worktrees."""
 
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -259,10 +258,11 @@ def run_sandbox(name: str, repo_name: str, main_git: Path, worktree_path: Path, 
         ports_prompt = f"You are running in a sandbox. Available ports for dev servers: {', '.join(map(str, ports))}. When starting dev servers, use --port {ports[0]} --host 0.0.0.0 (host binding required for port forwarding)."
         cmd_parts.extend(["--append-system-prompt", f"'{ports_prompt}'"])
 
-    # Wrap with vt (VibeTunnel) if available and not already in vt session
-    vt_check = run(["which", "vt"])
-    if vt_check.returncode == 0 and not os.environ.get("VIBETUNNEL_SESSION_ID"):
-        cmd_parts = ["vt"] + cmd_parts
+    # To wrap with VibeTunnel for session monitoring, uncomment:
+    # import os
+    # vt_check = run(["which", "vt"])
+    # if vt_check.returncode == 0 and not os.environ.get("VIBETUNNEL_SESSION_ID"):
+    #     cmd_parts = ["vt"] + cmd_parts
 
     # Output for shell wrapper: CD and EXEC directives
     print(f"__SANDBOX_CD__:{worktree_path}")
@@ -529,14 +529,19 @@ def post_exit(name, repo_name):
         git_worktree_remove(worktree_path)
     click.echo(f"Removed sandbox: {sname}", err=True)
 
-    # Offer to delete branch
+    # Offer to delete branch (run from main repo, not worktree)
     if branch_name and click.confirm(f"Delete branch '{branch_name}'?", default=False, err=True):
         if click.confirm("Confirm delete branch?", default=False, err=True):
-            result = run(["git", "branch", "-D", branch_name])
+            # Use -C to run from main repo directory
+            main_repo = repo_root.parent / repo_name if repo_root else None
+            if main_repo and main_repo.exists():
+                result = run(["git", "-C", str(main_repo), "branch", "-D", branch_name])
+            else:
+                result = run(["git", "branch", "-D", branch_name])
             if result.returncode == 0:
                 click.echo(f"Deleted branch: {branch_name}", err=True)
             else:
-                click.echo(f"Failed to delete branch", err=True)
+                click.echo(f"Failed to delete branch: {result.stderr}", err=True)
 
 
 @cli.command()
