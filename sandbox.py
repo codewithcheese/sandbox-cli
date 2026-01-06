@@ -123,6 +123,70 @@ def copy_env_files(src: Path, dest: Path) -> list[str]:
     return copied
 
 
+def setup_sandbox_claude_settings(worktree_path: Path) -> None:
+    """Copy sandbox hooks and merge Claude settings to worktree."""
+    import shutil
+    import json
+
+    sandbox_cli_dir = get_sandbox_cli_dir()
+    sandbox_claude_dir = sandbox_cli_dir / ".claude"
+    worktree_claude_dir = worktree_path / ".claude"
+
+    if not sandbox_claude_dir.exists():
+        return
+
+    # Ensure .claude directory exists in worktree
+    worktree_claude_dir.mkdir(exist_ok=True)
+
+    # Copy hooks directory
+    sandbox_hooks = sandbox_claude_dir / "hooks"
+    if sandbox_hooks.exists():
+        worktree_hooks = worktree_claude_dir / "hooks"
+        if worktree_hooks.exists():
+            shutil.rmtree(worktree_hooks)
+        shutil.copytree(sandbox_hooks, worktree_hooks)
+
+    # Merge settings.json
+    sandbox_settings_file = sandbox_claude_dir / "settings.json"
+    worktree_settings_file = worktree_claude_dir / "settings.json"
+
+    if sandbox_settings_file.exists():
+        sandbox_settings = json.loads(sandbox_settings_file.read_text())
+
+        if worktree_settings_file.exists():
+            # Merge with existing project settings
+            project_settings = json.loads(worktree_settings_file.read_text())
+            merged = merge_claude_settings(project_settings, sandbox_settings)
+        else:
+            merged = sandbox_settings
+
+        worktree_settings_file.write_text(json.dumps(merged, indent=2))
+
+
+def merge_claude_settings(project: dict, sandbox: dict) -> dict:
+    """Merge sandbox settings into project settings, combining hooks."""
+    import copy
+    result = copy.deepcopy(project)
+
+    # Merge hooks
+    if "hooks" in sandbox:
+        if "hooks" not in result:
+            result["hooks"] = {}
+        for event, hooks_list in sandbox["hooks"].items():
+            if event in result["hooks"]:
+                # Append sandbox hooks to project hooks
+                result["hooks"][event].extend(hooks_list)
+            else:
+                result["hooks"][event] = hooks_list
+
+    # Merge other top-level keys (sandbox overrides)
+    for key, value in sandbox.items():
+        if key != "hooks":
+            result[key] = value
+
+    return result
+
+
 def get_sandbox_cli_dir() -> Path:
     """Get the sandbox-cli installation directory."""
     return Path(__file__).parent
@@ -345,6 +409,7 @@ def start(name):
         copied = copy_env_files(repo_root, worktree_path)
         if copied:
             click.echo(f"Copied: {', '.join(copied)}", err=True)
+        setup_sandbox_claude_settings(worktree_path)
 
         click.echo(f"Created sandbox from local branch: {name}", err=True)
         run_sandbox(sname, repo_name, main_git, worktree_path, template=template)
@@ -360,6 +425,7 @@ def start(name):
         copied = copy_env_files(repo_root, worktree_path)
         if copied:
             click.echo(f"Copied: {', '.join(copied)}", err=True)
+        setup_sandbox_claude_settings(worktree_path)
 
         click.echo(f"Created sandbox from remote branch: {name}", err=True)
         run_sandbox(sname, repo_name, main_git, worktree_path, template=template)
@@ -375,6 +441,7 @@ def start(name):
         copied = copy_env_files(repo_root, worktree_path)
         if copied:
             click.echo(f"Copied: {', '.join(copied)}", err=True)
+        setup_sandbox_claude_settings(worktree_path)
 
         click.echo(f"Created sandbox: {sname}", err=True)
         run_sandbox(sname, repo_name, main_git, worktree_path, template=template)
