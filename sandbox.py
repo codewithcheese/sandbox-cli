@@ -311,6 +311,7 @@ def run_sandbox(name: str, repo_name: str, main_git: Path, worktree_path: Path, 
             "-e", "FORCE_COLOR=1",
             "-e", "COLORTERM=truecolor",
             "-v", f"{home}/.ssh:/home/agent/.ssh:ro",
+            "-v", f"{home}/Library/pnpm/store:/pnpm-store",
         ]
         # Add dynamic port mappings
         ports = find_available_ports(3)
