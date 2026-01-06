@@ -123,11 +123,43 @@ def copy_env_files(src: Path, dest: Path) -> list[str]:
     return copied
 
 
+def get_sandbox_cli_dir() -> Path:
+    """Get the sandbox-cli installation directory."""
+    return Path(__file__).parent
+
+
+def ensure_default_image() -> str:
+    """Ensure the default sandbox image exists, build if needed."""
+    image_name = "sandbox-cli:default"
+
+    # Check if image exists
+    result = run(["docker", "image", "inspect", image_name])
+    if result.returncode == 0:
+        return image_name
+
+    # Build default image
+    dockerfile = get_sandbox_cli_dir() / "Dockerfile"
+    if not dockerfile.exists():
+        click.echo(f"Default Dockerfile not found: {dockerfile}", err=True)
+        sys.exit(1)
+
+    click.echo("Building default sandbox image...")
+    result = run(
+        ["docker", "build", "-t", image_name, "-f", str(dockerfile), str(get_sandbox_cli_dir())],
+        capture=False,
+    )
+    if result.returncode != 0:
+        click.echo("Failed to build default image", err=True)
+        sys.exit(1)
+
+    return image_name
+
+
 def build_template_if_exists(repo_root: Path) -> str | None:
-    """Build custom template if Dockerfile.sandbox exists."""
+    """Build custom template if Dockerfile.sandbox exists, otherwise use default."""
     dockerfile = repo_root / "Dockerfile.sandbox"
     if not dockerfile.exists():
-        return None
+        return ensure_default_image()
 
     image_name = f"sandbox-template:{repo_root.name}"
     click.echo("Building project template...")
@@ -179,7 +211,7 @@ def container_running(name: str) -> bool:
 def run_sandbox(name: str, repo_name: str, main_git: Path, worktree_path: Path, template: str | None = None, resume: bool = False) -> None:
     """Output sandbox run command for shell wrapper to execute."""
     home = Path.home()
-    image = template or f"sandbox-template:{repo_name}"
+    image = template or ensure_default_image()
     container_name = f"sandbox-{repo_name}-{name}"
 
     claude_cmd = ["claude", "--dangerously-skip-permissions"]
