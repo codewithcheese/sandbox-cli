@@ -296,10 +296,22 @@ def sandbox_exists(repo_name: str, name: str) -> bool:
     return container_exists(f"sandbox-{repo_name}-{name}")
 
 
+def generate_sandbox_name() -> str:
+    """Generate a random sandbox name."""
+    import random
+    adjectives = ["quick", "bright", "calm", "bold", "swift", "keen", "warm", "cool", "fair", "wise"]
+    nouns = ["fox", "owl", "bear", "wolf", "hawk", "deer", "hare", "lynx", "seal", "wren"]
+    return f"{random.choice(adjectives)}-{random.choice(nouns)}"
+
+
 @cli.command()
-@click.argument("name")
+@click.argument("name", required=False)
 def start(name):
     """Start a sandbox (creates if new, resumes if exists)."""
+    if not name:
+        name = generate_sandbox_name()
+        click.echo(f"Generated name: {name}", err=True)
+
     repo_root = get_repo_root()
     if not repo_root:
         click.echo("Not in a git repository", err=True)
