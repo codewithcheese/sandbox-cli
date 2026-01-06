@@ -6,7 +6,7 @@ SHA="${1:-$(git rev-parse HEAD)}"
 LIMIT="${LIMIT:-50}"
 SLEEP="${SLEEP:-15}"
 
-echo "Watching GitHub Actions for commit: ${SHA:0:8}"
+echo "Watching GitHub Actions for commit: $SHA"
 
 # Wait for runs to appear (up to 5 min)
 for _ in $(seq 1 60); do
@@ -37,9 +37,9 @@ done
 # Summary
 failures="$(jq '[.[] | select((.conclusion // "") != "success")] | length' <<<"$runs_json")"
 if [[ "$failures" -gt 0 ]]; then
-  echo -e "\n❌ Failed:"
+  echo -e "\n❌ CI FAILED for commit $SHA"
   jq -r '.[] | select((.conclusion // "") != "success") | "  \(.workflowName): \(.conclusion // "unknown")\n  \(.url)"' <<<"$runs_json"
   exit 1
 fi
 
-echo -e "\n✅ All workflows passed"
+echo -e "\n✅ CI PASSED for commit $SHA"
