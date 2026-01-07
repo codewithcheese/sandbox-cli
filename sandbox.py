@@ -293,6 +293,15 @@ def branch_exists(branch: str) -> bool:
     return result.returncode == 0
 
 
+def get_worktree_for_branch(branch: str) -> Path | None:
+    """Get the worktree path for a branch if it's already checked out."""
+    for wt in git_worktree_list():
+        wt_branch = wt.get("branch", "").replace("refs/heads/", "")
+        if wt_branch == branch:
+            return Path(wt["path"])
+    return None
+
+
 def remote_branch_exists(branch: str) -> bool:
     """Check if a remote branch exists."""
     # Fetch first to ensure we have latest refs
@@ -345,19 +354,29 @@ def start(name):
         click.echo(f"Starting sandbox: {sname}", err=True)
         run_sandbox(sname, repo_name, main_git, worktree_path, template=template)
     elif branch_exists(name):
-        # Existing local branch - create worktree from it
-        template = build_template_if_exists(repo_root)
+        # Existing local branch - check if already in a worktree
+        existing_wt = get_worktree_for_branch(name)
+        if existing_wt:
+            # Branch already checked out - use existing worktree
+            click.echo(f"Using existing worktree for branch: {name}", err=True)
+            template = build_template_if_exists(repo_root)
+            # Extract sandbox name from worktree path
+            wt_sname = existing_wt.name.split("__")[-1] if "__" in existing_wt.name else sname
+            run_sandbox(wt_sname, repo_name, main_git, existing_wt, template=template)
+        else:
+            # Create worktree from existing branch
+            template = build_template_if_exists(repo_root)
 
-        if not git_worktree_add(worktree_path, name, new_branch=False):
-            click.echo(f"Failed to create worktree for branch: {name}", err=True)
-            sys.exit(1)
+            if not git_worktree_add(worktree_path, name, new_branch=False):
+                click.echo(f"Failed to create worktree for branch: {name}", err=True)
+                sys.exit(1)
 
-        copied = copy_env_files(repo_root, worktree_path)
-        if copied:
-            click.echo(f"Copied: {', '.join(copied)}", err=True)
+            copied = copy_env_files(repo_root, worktree_path)
+            if copied:
+                click.echo(f"Copied: {', '.join(copied)}", err=True)
 
-        click.echo(f"Created sandbox from local branch: {name}", err=True)
-        run_sandbox(sname, repo_name, main_git, worktree_path, template=template)
+            click.echo(f"Created sandbox from local branch: {name}", err=True)
+            run_sandbox(sname, repo_name, main_git, worktree_path, template=template)
     elif remote_branch_exists(name):
         # Existing remote branch - create worktree tracking it
         template = build_template_if_exists(repo_root)
