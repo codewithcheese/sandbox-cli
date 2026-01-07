@@ -248,8 +248,9 @@ def run_sandbox(name: str, repo_name: str, main_git: Path, worktree_path: Path, 
             "-e", "CLAUDE_CONFIG_DIR=/home/agent/.claude",
             "-e", "FORCE_COLOR=1",
             "-e", "COLORTERM=truecolor",
+            "-e", "npm_config_store_dir=/pnpm-store",
             "-v", f"{home}/.ssh:/home/agent/.ssh:ro",
-            "-v", f"{home}/Library/pnpm/store:/pnpm-store",
+            "-v", "pnpm-store:/pnpm-store",
             "-v", f"{sandbox_cli_dir}/.claude:/opt/sandbox-claude:ro",
         ]
         # Add dynamic port mappings
