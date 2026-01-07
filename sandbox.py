@@ -382,9 +382,8 @@ def start(name):
             click.echo("Warning: Could not pull latest changes", err=True)
 
         template = build_template_if_exists(repo_root)
-        branch_name = f"task/{name}"
 
-        if not git_worktree_add(worktree_path, branch_name, new_branch=True):
+        if not git_worktree_add(worktree_path, name, new_branch=True):
             click.echo(f"Failed to create worktree", err=True)
             sys.exit(1)
 
