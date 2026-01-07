@@ -13,10 +13,10 @@ if git diff --quiet && git diff --cached --quiet && [ -z "$untracked" ]; then
   exit 0  # No changes
 fi
 
-# Output JSON to prompt Claude to commit
+# Output a reminder (non-blocking) about uncommitted changes
 cat << 'EOF'
 {
-  "decision": "block",
-  "reason": "There are uncommitted changes in the repository. Please run `git status` to review, and if the code is ready, commit and push the changes."
+  "decision": "allow",
+  "systemMessage": "Reminder: There are uncommitted changes in the repository. If your work is complete, please commit and push before stopping."
 }
 EOF

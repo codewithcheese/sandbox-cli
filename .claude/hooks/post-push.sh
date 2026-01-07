@@ -22,6 +22,12 @@ if [[ "$exit_code" != "0" ]] && [[ -n "$exit_code" ]]; then
   exit 0
 fi
 
+# Check if repo has GitHub Actions workflows
+workflows_dir="$(git rev-parse --show-toplevel 2>/dev/null)/.github/workflows"
+if [[ ! -d "$workflows_dir" ]] || [[ -z "$(ls -A "$workflows_dir" 2>/dev/null)" ]]; then
+  exit 0
+fi
+
 # Instruct Claude to start CI monitoring
 cat << 'EOF'
 {
