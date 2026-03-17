@@ -12,7 +12,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 IMAGE_NAME = "sandbox-cli:test"
-DOCKERFILE = Path(__file__).parent.parent / "Dockerfile"
+DOCKERFILE = Path(__file__).parent.parent / "sandbox_cli" / "Dockerfile"
 
 
 @pytest.fixture(scope="module")
