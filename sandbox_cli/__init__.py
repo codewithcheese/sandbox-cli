@@ -3,6 +3,7 @@
 
 import fcntl
 import json
+import os
 import subprocess
 import sys
 from contextlib import contextmanager
@@ -137,6 +138,46 @@ def extract_codex_response(worktree_path: Path, log_path: Path) -> str | None:
                 return line
 
     return None
+
+
+def extract_gemini_response(worktree_path: Path, log_path: Path) -> str | None:
+    """Extract response text from Gemini CLI JSON output.
+
+    1. Parse log_path as a single JSON object and return the 'response' field.
+    2. Fall back to last non-empty, non-JSON line if no 'response' found.
+    3. Return None if no content.
+
+    worktree_path is accepted for interface consistency but not used.
+    """
+    if not log_path.exists():
+        return None
+
+    content = log_path.read_text().strip()
+    if not content:
+        return None
+
+    # Try each line as JSON, look for 'response' key
+    last_non_json = None
+    for line in content.splitlines():
+        line_stripped = line.strip()
+        if not line_stripped:
+            continue
+        try:
+            obj = json.loads(line_stripped)
+            if isinstance(obj, dict) and "response" in obj:
+                return obj["response"]
+        except (json.JSONDecodeError, ValueError):
+            last_non_json = line_stripped
+
+    # Try the whole content as a single JSON object
+    try:
+        obj = json.loads(content)
+        if isinstance(obj, dict) and "response" in obj:
+            return obj["response"]
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    return last_non_json
 
 
 def parse_diff_stats(numstat: str) -> dict:
@@ -402,8 +443,39 @@ def get_provider(name: str) -> dict:
             "auth_check": lambda: None if (Path.home() / ".codex" / "auth.json").exists() else
                 "No Codex auth found. Run: codex login",
         }
+    elif name == "gemini":
+        return {
+            "name": "gemini",
+            "build_cmd": lambda task, model, worktree_path: [
+                "gemini", "-p", task, "--output-format", "json", "--yolo",
+                *(["--model", model] if model else []),
+            ],
+            "build_resume_cmd": lambda model, worktree_path: (_ for _ in ()).throw(
+                click.UsageError("Gemini provider does not support --continue")
+            ),
+            "env_vars": lambda: [
+                "GEMINI_CLI_HOME=/home/agent",
+                f"GH_TOKEN={get_gh_token()}",
+                *(
+                    [f"GEMINI_API_KEY={os.environ['GEMINI_API_KEY']}"]
+                    if os.environ.get("GEMINI_API_KEY")
+                    else []
+                ),
+            ],
+            "volume_mounts": lambda home: [
+                f"{home}/.gemini:/home/agent/.gemini",
+                f"{home}/.ssh:/home/agent/.ssh:ro",
+                f"{home}/.config/gh:/home/agent/.config/gh:ro",
+                "pnpm-store:/pnpm-store",
+            ],
+            "extract_response": extract_gemini_response,
+            "auth_check": lambda: None if (
+                os.environ.get("GEMINI_API_KEY") or (Path.home() / ".gemini").is_dir()
+            ) else
+                "No Gemini auth found. Set GEMINI_API_KEY or run: gemini (to login with Google account)",
+        }
     else:
-        raise click.UsageError(f"Unknown provider: {name}. Choose from: claude, codex")
+        raise click.UsageError(f"Unknown provider: {name}. Choose from: claude, codex, gemini")
 
 
 def find_available_ports(count: int = 3, start: int = 49152, end: int = 65535) -> list[int]:
@@ -735,7 +807,7 @@ COMMANDS:
            --task <prompt>         Run as background task (non-interactive)
            --task-file <path>      Read prompt from file (mutually exclusive with --task)
            --model <model>         Model to pass to the agent (e.g. haiku, sonnet, gpt-4.1)
-           --provider <name>       Agent provider: claude (default) or codex (background only)
+           --provider <name>       Agent provider: claude (default), codex, or gemini (background only)
            --push                  Push branch to origin after successful commit
            --cleanup               Remove worktree after completion
            Interactive: launches Docker container with Claude CLI
@@ -868,7 +940,7 @@ def auth(token):
 @click.option("--push", is_flag=True, help="Push branch to origin after successful commit.")
 @click.option("--cleanup", is_flag=True, help="Remove worktree and container after completion.")
 @click.option("--provider", "provider", default="claude",
-              type=click.Choice(["claude", "codex"]),
+              type=click.Choice(["claude", "codex", "gemini"]),
               help="Agent provider to use for background tasks (default: claude).")
 def start(name, continue_session, task, task_file, model, push, cleanup, provider):
     """Start a sandbox (creates if new, resumes if exists)."""
@@ -891,9 +963,9 @@ def start(name, continue_session, task, task_file, model, push, cleanup, provide
         click.echo("--continue requires a sandbox name", err=True)
         sys.exit(1)
 
-    # Codex only supports background task mode
-    if provider == "codex" and not task and not task_file and not continue_session:
-        click.echo("Codex provider only supports background task mode", err=True)
+    # Codex and Gemini only support background task mode
+    if provider in ("codex", "gemini") and not task and not task_file and not continue_session:
+        click.echo(f"{provider.capitalize()} provider only supports background task mode", err=True)
         sys.exit(1)
 
     if not name:
