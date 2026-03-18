@@ -620,8 +620,9 @@ COMMANDS:
   rm       Remove a sandbox and all its artifacts
            <name>                  Sandbox name to remove
            --all                   Remove all sandboxes for current repo
-           --force                 Skip prompts, delete branch, allow removing running tasks
-           Removes: container, worktree, log files, branch (with --force or prompt)
+           --yes, -y               Skip prompts and auto-delete branch
+           --force                 Allow removing a running task (kills the container)
+           Removes: container, worktree, log files, branch (with --yes or prompt)
 
   auth     Save Claude authentication token for sandbox containers
            <token>                 Token from `claude setup-token` (omit to check status)
@@ -646,7 +647,7 @@ USAGE WITH CLAUDE CODE:
     1. sandbox start proto-1 --task "implement the auth module" --model sonnet
     2. Notified with JSON result containing worktreePath and modifiedFiles
     3. Read the changes from worktreePath to review the work
-    4. sandbox rm proto-1 --force  (when done, cleans up worktree + branch)
+    4. sandbox rm proto-1 --yes  (when done, cleans up worktree + branch)
 
   The worktree is preserved after completion so you can inspect the changes.
   Use --push to also push the branch to origin.
@@ -942,8 +943,9 @@ def list_cmd():
 @cli.command()
 @click.argument("name", required=False)
 @click.option("--all", "remove_all", is_flag=True, help="Remove all sandboxes for current repo.")
-@click.option("--force", is_flag=True, help="Remove even if task is running.")
-def rm(name, remove_all, force):
+@click.option("--force", is_flag=True, help="Allow removing a running task (kills the container).")
+@click.option("--yes", "-y", is_flag=True, help="Skip prompts and auto-delete branch.")
+def rm(name, remove_all, force, yes):
     """Remove a sandbox and all its artifacts."""
     repo_root = get_repo_root()
     if not repo_root:
@@ -968,7 +970,7 @@ def rm(name, remove_all, force):
         try:
             data = json.loads(sb["log_json"].read_text())
             if data.get("status") == "running" and container_running(container_name) and not force:
-                click.echo(f"Task is running. Use --force to remove.", err=True)
+                click.echo(f"Task is running. Use --force if you are sure you want to kill it.", err=True)
                 sys.exit(1)
         except (json.JSONDecodeError, OSError):
             pass
@@ -1001,9 +1003,9 @@ def rm(name, remove_all, force):
         click.echo(f"Nothing found to remove for: {sname}", err=True)
         sys.exit(1)
 
-    # Delete branch: --force skips prompt (for agents), otherwise ask
+    # Delete branch: --yes skips prompt (for agents), otherwise ask
     if branch_name and removed_worktree:
-        should_delete = force or click.confirm(f"Delete branch '{branch_name}'?", default=False)
+        should_delete = yes or click.confirm(f"Delete branch '{branch_name}'?", default=False)
         if should_delete:
             result = run(["git", "branch", "-D", branch_name])
             if result.returncode == 0:

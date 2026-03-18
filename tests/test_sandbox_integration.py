@@ -53,7 +53,7 @@ def cleanup_sandbox(sandbox_name, runner, cli):
     """Ensure sandbox is cleaned up after each test."""
     yield
     # Force cleanup regardless of test outcome
-    runner.invoke(cli, ["rm", sandbox_name, "--force"], input="n\n")
+    runner.invoke(cli, ["rm", sandbox_name, "--force", "--yes"])
 
 
 class TestBackgroundTaskEndToEnd:
