@@ -352,11 +352,12 @@ def run_sandbox_background(
     repo_name: str,
     main_git: Path,
     image: str,
-    task: str,
+    task: str | None,
     logs_dir: Path,
     model: str | None = None,
     push: bool = False,
     cleanup: bool = False,
+    continue_session: bool = False,
 ) -> dict:
     """Run a sandbox task in background mode. Returns result dict."""
     sb = resolve_sandbox(repo_root, name, logs_dir=logs_dir, repo_name=repo_name)
@@ -366,7 +367,27 @@ def run_sandbox_background(
     log_file = sb["log_json"]
     error_result = {"container": container_name, "name": sname, "branch": name}
 
-    # Step 3: Check for conflicts
+    if continue_session:
+        # Resume: container must exist
+        if not container_exists(container_name):
+            return {**error_result, "error": f"No container to resume: {container_name}"}
+
+        base_result = run(["git", "-C", str(worktree_path), "rev-parse", "HEAD"])
+        base_commit = base_result.stdout.strip()
+
+        claude_cmd = ["claude", "--continue", "--print", "--verbose", "--output-format", "stream-json", "--dangerously-skip-permissions"]
+        if model:
+            claude_cmd.extend(["--model", model])
+
+        # Start container if stopped, then exec
+        if not container_running(container_name):
+            run(["docker", "start", container_name])
+        exec_result = run(["docker", "exec", container_name] + claude_cmd)
+
+        result = _collect_and_finalize(sb, exec_result.returncode, base_commit, repo_root, name, push=push, cleanup=cleanup)
+        return result
+
+    # New task: check for conflicts
     if container_exists(container_name):
         return {**error_result, "error": f"Container already exists: {container_name}"}
     if branch_exists(name):
@@ -376,7 +397,7 @@ def run_sandbox_background(
     if log_file.exists():
         return {**error_result, "error": f"Log file already exists: {log_file}"}
 
-    # Step 4: Create worktree
+    # Create worktree
     if not git_worktree_add(worktree_path, name, new_branch=True):
         return {**error_result, "error": "Failed to create worktree"}
 
@@ -384,7 +405,7 @@ def run_sandbox_background(
     base_result = run(["git", "-C", str(worktree_path), "rev-parse", "HEAD"])
     base_commit = base_result.stdout.strip()
 
-    # Step 4b: Write state file (name reservation + recovery metadata)
+    # Write state file (name reservation + recovery metadata)
     logs_dir.mkdir(parents=True, exist_ok=True)
     state = {
         "status": "running",
@@ -396,10 +417,10 @@ def run_sandbox_background(
     }
     log_file.write_text(json.dumps(state))
 
-    # Step 5: Copy .env files
+    # Copy .env files
     copy_env_files(repo_root, worktree_path)
 
-    # Step 6: Launch container detached
+    # Launch container detached
     home = Path.home()
     claude_cmd = ["claude", "-p", task, "--print", "--verbose", "--output-format", "stream-json", "--dangerously-skip-permissions"]
     if model:
@@ -433,7 +454,7 @@ def run_sandbox_background(
         log_file.unlink(missing_ok=True)
         return {**error_result, "error": f"Failed to launch container: {launch.stderr}"}
 
-    # Step 7: Wait
+    # Wait
     wait_result = run(["docker", "wait", container_name])
     try:
         exit_code = int(wait_result.stdout.strip())
@@ -529,21 +550,20 @@ def _collect_and_finalize(sb: dict, exit_code: int, base_commit: str, repo_root:
     return result
 
 
-def run_sandbox(name: str, repo_name: str, main_git: Path, worktree_path: Path, template: str | None = None, resume: bool = False) -> None:
+def run_sandbox(name: str, repo_name: str, main_git: Path, worktree_path: Path, template: str | None = None) -> None:
     """Output sandbox run command for shell wrapper to execute."""
     home = Path.home()
     image = template or ensure_default_image()
     container_name = f"sandbox-{repo_name}-{name}"
 
     claude_cmd = ["claude", "--dangerously-skip-permissions"]
-    if resume:
-        claude_cmd.append("--continue")
 
     # Will be set after ports are determined for new containers
     ports_prompt = None
 
-    # Check if container already exists
+    # Check if container already exists - session lives in the container
     if container_exists(container_name):
+        claude_cmd.append("--continue")
         if container_running(container_name):
             # Exec into running container
             cmd_parts = ["docker", "exec", "-it", container_name] + claude_cmd
@@ -552,7 +572,7 @@ def run_sandbox(name: str, repo_name: str, main_git: Path, worktree_path: Path, 
             cmd_parts = ["docker", "start", container_name, "&&",
                         "docker", "exec", "-it", container_name] + claude_cmd
     else:
-        # Create new container
+        # Create new container - fresh session
         cmd_parts = [
             "docker", "run", "-it",
             "--name", container_name,
@@ -724,15 +744,20 @@ def auth(token):
             sys.exit(1)
 
 
-@cli.command()
+@cli.command(name="start")
 @click.argument("name", required=False)
+@click.option("--continue", "continue_session", is_flag=True, help="Resume a crashed background task.")
 @click.option("--task", default=None, help="Run in background mode with this prompt.")
 @click.option("--task-file", default=None, type=click.Path(exists=True), help="Read prompt from file.")
 @click.option("--model", default=None, help="Model to pass to Claude.")
 @click.option("--push", is_flag=True, help="Push branch to origin after successful commit.")
 @click.option("--cleanup", is_flag=True, help="Remove worktree and container after completion.")
-def start(name, task, task_file, model, push, cleanup):
+def start(name, continue_session, task, task_file, model, push, cleanup):
     """Start a sandbox (creates if new, resumes if exists)."""
+    if continue_session and (task or task_file):
+        click.echo("Cannot specify both --continue and --task/--task-file", err=True)
+        sys.exit(1)
+
     if task is not None and task_file:
         click.echo("Cannot specify both --task and --task-file", err=True)
         sys.exit(1)
@@ -744,6 +769,10 @@ def start(name, task, task_file, model, push, cleanup):
         click.echo("Task prompt cannot be empty", err=True)
         sys.exit(1)
 
+    if continue_session and not name:
+        click.echo("--continue requires a sandbox name", err=True)
+        sys.exit(1)
+
     if not name:
         name = generate_sandbox_name()
         click.echo(f"Generated name: {name}", err=True)
@@ -753,7 +782,7 @@ def start(name, task, task_file, model, push, cleanup):
         click.echo("Not in a git repository", err=True)
         sys.exit(1)
 
-    if task:
+    if task or continue_session:
         # Background mode
         main_git = get_main_git_dir(repo_root)
         image = build_template_if_exists(repo_root)
@@ -768,6 +797,7 @@ def start(name, task, task_file, model, push, cleanup):
             model=model,
             push=push,
             cleanup=cleanup,
+            continue_session=continue_session,
         )
         click.echo(json.dumps(result))
         return
@@ -778,10 +808,8 @@ def start(name, task, task_file, model, push, cleanup):
     main_git = get_main_git_dir(repo_root)
 
     if worktree_path.exists() and sandbox_exists(repo_name, sname):
-        # Existing sandbox - recreate container
-        container_name = f"sandbox-{repo_name}-{sname}"
-        docker_container_rm(container_name)
-        click.echo(f"Recreating sandbox: {sname}", err=True)
+        # Existing sandbox - resume session
+        click.echo(f"Resuming sandbox: {sname}", err=True)
         template = build_template_if_exists(repo_root)
         run_sandbox(sname, repo_name, main_git, worktree_path, template=template)
     elif worktree_path.exists():
@@ -975,12 +1003,7 @@ def rm(name, remove_all, force, yes):
         except (json.JSONDecodeError, OSError):
             pass
 
-    # Get branch name before removing worktree
-    branch_name = None
-    for wt in git_worktree_list():
-        if wt.get("path") == str(worktree_path):
-            branch_name = wt.get("branch", "").replace("refs/heads/", "")
-            break
+    branch_name = sb["branch"]
 
     removed_container = docker_container_rm(container_name)
     removed_worktree = git_worktree_remove(worktree_path)
@@ -999,12 +1022,12 @@ def rm(name, remove_all, force, yes):
     if removed_logs:
         click.echo(f"Removed logs for: {sname}")
 
-    if not removed_container and not removed_worktree and not removed_logs:
+    if not removed_container and not removed_worktree and not removed_logs and not branch_exists(branch_name):
         click.echo(f"Nothing found to remove for: {sname}", err=True)
         sys.exit(1)
 
     # Delete branch: --yes skips prompt (for agents), otherwise ask
-    if branch_name and removed_worktree:
+    if branch_exists(branch_name):
         should_delete = yes or click.confirm(f"Delete branch '{branch_name}'?", default=False)
         if should_delete:
             result = run(["git", "branch", "-D", branch_name])
