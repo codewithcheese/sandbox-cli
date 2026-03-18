@@ -8,7 +8,7 @@ import pytest
 import click
 from click.testing import CliRunner
 
-from sandbox_cli import extract_codex_response, get_provider
+from sandbox_cli import extract_codex_response, extract_gemini_response, get_provider
 
 
 # ---------------------------------------------------------------------------
@@ -589,3 +589,359 @@ class TestProviderErrorMessage:
         assert "error" in result
         assert "claude" in result["error"].lower()
         assert "1" in result["error"]
+
+
+# ---------------------------------------------------------------------------
+# extract_gemini_response
+# ---------------------------------------------------------------------------
+
+class TestExtractGeminiResponse:
+    """AC#8: extract_gemini_response test cases."""
+
+    def test_returns_response_field_from_json(self, tmp_path):
+        """(a) returns 'response' field from JSON output."""
+        log_path = tmp_path / "container.log"
+        log_path.write_text('{"response": "Task completed successfully.", "exitCode": 0}\n')
+
+        result = extract_gemini_response(tmp_path / "worktree", log_path)
+        assert result == "Task completed successfully."
+
+    def test_skips_objects_without_response_falls_back_to_last_non_json_line(self, tmp_path):
+        """(b) skips JSON objects without 'response' key, falls back to last non-empty non-JSON line."""
+        log_path = tmp_path / "container.log"
+        log_path.write_text(
+            '{"type": "info", "msg": "starting"}\n'
+            'Here is the final answer\n'
+            '{"type": "status", "done": true}\n'
+            '\n'
+        )
+
+        result = extract_gemini_response(tmp_path / "worktree", log_path)
+        assert result == "Here is the final answer"
+
+    def test_returns_none_when_log_has_no_content(self, tmp_path):
+        """(c) returns None when log has no content."""
+        log_path = tmp_path / "container.log"
+        log_path.write_text("")
+
+        result = extract_gemini_response(tmp_path / "worktree", log_path)
+        assert result is None
+
+    def test_returns_none_when_log_missing(self, tmp_path):
+        """(c) returns None when log file doesn't exist."""
+        log_path = tmp_path / "nonexistent.log"
+
+        result = extract_gemini_response(tmp_path / "worktree", log_path)
+        assert result is None
+
+    def test_handles_malformed_json_gracefully(self, tmp_path):
+        """(d) handles malformed/partial JSON lines gracefully (skip them)."""
+        log_path = tmp_path / "container.log"
+        log_path.write_text(
+            '{"response": "good"\n'  # malformed (no closing brace)
+            'plain text fallback\n'
+            '{bad json here\n'
+        )
+
+        result = extract_gemini_response(tmp_path / "worktree", log_path)
+        # All JSON lines are malformed, should fall back to last non-JSON line
+        assert result == "{bad json here" or result == "plain text fallback"
+        # Should not raise
+
+    def test_whole_content_json_with_response(self, tmp_path):
+        """Single JSON object spanning file content is parsed correctly."""
+        log_path = tmp_path / "container.log"
+        data = {"response": "All done!", "steps": 3}
+        log_path.write_text(json.dumps(data))
+
+        result = extract_gemini_response(tmp_path / "worktree", log_path)
+        assert result == "All done!"
+
+    def test_worktree_path_not_used(self, tmp_path):
+        """worktree_path parameter is accepted but not used."""
+        log_path = tmp_path / "container.log"
+        log_path.write_text('{"response": "done"}\n')
+        fake_worktree = Path("/nonexistent/path")
+
+        result = extract_gemini_response(fake_worktree, log_path)
+        assert result == "done"
+
+
+# ---------------------------------------------------------------------------
+# Gemini provider: get_provider("gemini")
+# ---------------------------------------------------------------------------
+
+class TestGeminiProvider:
+    """AC#1-7, AC#11-17: Gemini provider tests."""
+
+    def test_gemini_provider_name(self):
+        provider = get_provider("gemini")
+        assert provider["name"] == "gemini"
+
+    def test_gemini_build_cmd_basic(self):
+        """AC#1: build_cmd uses gemini -p <task> --output-format json --yolo."""
+        provider = get_provider("gemini")
+        cmd = provider["build_cmd"]("hello", None, Path("/worktree"))
+        assert cmd[0] == "gemini"
+        assert "-p" in cmd
+        assert "hello" in cmd
+        assert "--output-format" in cmd
+        assert "json" in cmd
+        assert "--yolo" in cmd
+
+    def test_gemini_build_cmd_with_model(self):
+        """AC#2: --model is included in gemini command when provided."""
+        provider = get_provider("gemini")
+        cmd = provider["build_cmd"]("hello", "gemini-2.5-flash", Path("/worktree"))
+        assert "--model" in cmd
+        assert "gemini-2.5-flash" in cmd
+
+    def test_gemini_build_cmd_no_model(self):
+        """No --model flag when model is None."""
+        provider = get_provider("gemini")
+        cmd = provider["build_cmd"]("hello", None, Path("/worktree"))
+        assert "--model" not in cmd
+
+    def test_gemini_build_resume_cmd_raises(self):
+        """AC#4: build_resume_cmd raises UsageError for gemini."""
+        provider = get_provider("gemini")
+        with pytest.raises(click.UsageError, match="does not support --continue"):
+            provider["build_resume_cmd"](None, Path("/worktree"))
+
+    def test_gemini_env_vars_contains_gemini_cli_home(self):
+        """AC#6: env_vars includes GEMINI_CLI_HOME=/home/agent."""
+        with patch("sandbox_cli.get_gh_token", return_value="ghp_test"), \
+             patch.dict("os.environ", {}, clear=True):
+            provider = get_provider("gemini")
+            env_vars = provider["env_vars"]()
+        assert any(v == "GEMINI_CLI_HOME=/home/agent" for v in env_vars)
+
+    def test_gemini_env_vars_passes_gh_token(self):
+        """AC#6: env_vars always includes GH_TOKEN."""
+        with patch("sandbox_cli.get_gh_token", return_value="ghp_test"), \
+             patch.dict("os.environ", {}, clear=True):
+            provider = get_provider("gemini")
+            env_vars = provider["env_vars"]()
+        assert any(v == "GH_TOKEN=ghp_test" for v in env_vars)
+
+    def test_gemini_env_vars_includes_api_key_when_set(self):
+        """AC#6: GEMINI_API_KEY is included only if set in host environment."""
+        with patch("sandbox_cli.get_gh_token", return_value="ghp"), \
+             patch.dict("os.environ", {"GEMINI_API_KEY": "my-key"}, clear=False):
+            provider = get_provider("gemini")
+            env_vars = provider["env_vars"]()
+        assert any(v == "GEMINI_API_KEY=my-key" for v in env_vars)
+
+    def test_gemini_env_vars_excludes_api_key_when_not_set(self):
+        """AC#6: GEMINI_API_KEY is not included when absent from host environment."""
+        env_without_key = {k: v for k, v in __import__("os").environ.items() if k != "GEMINI_API_KEY"}
+        with patch("sandbox_cli.get_gh_token", return_value="ghp"), \
+             patch.dict("os.environ", env_without_key, clear=True):
+            provider = get_provider("gemini")
+            env_vars = provider["env_vars"]()
+        assert not any("GEMINI_API_KEY" in v for v in env_vars)
+
+    def test_gemini_volume_mounts_contains_gemini_dir(self):
+        """AC#5: volume_mounts includes ~/.gemini mount."""
+        provider = get_provider("gemini")
+        home = Path("/home/user")
+        mounts = provider["volume_mounts"](home)
+        assert any(".gemini" in m for m in mounts)
+        # rw (no :ro suffix)
+        gemini_mount = next(m for m in mounts if ".gemini" in m)
+        assert not gemini_mount.endswith(":ro")
+
+    def test_gemini_volume_mounts_contains_ssh_ro(self):
+        """AC#5: volume_mounts includes .ssh:ro."""
+        provider = get_provider("gemini")
+        mounts = provider["volume_mounts"](Path("/home/user"))
+        assert any(".ssh" in m and m.endswith(":ro") for m in mounts)
+
+    def test_gemini_volume_mounts_contains_gh_config_ro(self):
+        """AC#5: volume_mounts includes .config/gh:ro."""
+        provider = get_provider("gemini")
+        mounts = provider["volume_mounts"](Path("/home/user"))
+        assert any(".config/gh" in m and m.endswith(":ro") for m in mounts)
+
+    def test_gemini_volume_mounts_contains_pnpm_store(self):
+        """AC#5: volume_mounts includes pnpm-store."""
+        provider = get_provider("gemini")
+        mounts = provider["volume_mounts"](Path("/home/user"))
+        assert any("pnpm-store" in m for m in mounts)
+
+    def test_gemini_volume_mounts_no_dash_v_prefix(self):
+        """volume_mounts() returns strings without -v prefix."""
+        provider = get_provider("gemini")
+        mounts = provider["volume_mounts"](Path("/home/user"))
+        for mount in mounts:
+            assert not mount.startswith("-v")
+
+    def test_gemini_auth_check_passes_with_api_key(self, tmp_path):
+        """AC#7: auth_check returns None when GEMINI_API_KEY is set."""
+        with patch.dict("os.environ", {"GEMINI_API_KEY": "my-key"}, clear=False):
+            provider = get_provider("gemini")
+            result = provider["auth_check"]()
+        assert result is None
+
+    def test_gemini_auth_check_passes_with_gemini_dir(self, tmp_path):
+        """AC#7: auth_check returns None when ~/.gemini/ directory exists."""
+        (tmp_path / ".gemini").mkdir()
+        with patch("pathlib.Path.home", return_value=tmp_path), \
+             patch.dict("os.environ", {k: v for k, v in __import__("os").environ.items() if k != "GEMINI_API_KEY"}, clear=True):
+            provider = get_provider("gemini")
+            result = provider["auth_check"]()
+        assert result is None
+
+    def test_gemini_auth_check_fails_when_no_auth(self, tmp_path):
+        """AC#7: auth_check returns error string when no auth present."""
+        env_without_key = {k: v for k, v in __import__("os").environ.items() if k != "GEMINI_API_KEY"}
+        with patch("pathlib.Path.home", return_value=tmp_path), \
+             patch.dict("os.environ", env_without_key, clear=True):
+            provider = get_provider("gemini")
+            result = provider["auth_check"]()
+        assert result is not None
+        assert "GEMINI_API_KEY" in result or "gemini" in result.lower()
+
+    def test_gemini_extract_response_uses_extract_gemini_response(self):
+        """Gemini provider's extract_response is extract_gemini_response."""
+        from sandbox_cli import extract_gemini_response as egr
+        provider = get_provider("gemini")
+        assert provider["extract_response"] is egr
+
+
+# ---------------------------------------------------------------------------
+# CLI: gemini provider flag parsing
+# ---------------------------------------------------------------------------
+
+class TestGeminiCLI:
+    """AC#3, AC#4, AC#14, AC#15: CLI tests for gemini provider."""
+
+    @pytest.fixture
+    def runner(self):
+        return CliRunner()
+
+    @pytest.fixture
+    def cli(self):
+        from sandbox_cli import cli
+        return cli
+
+    def test_gemini_passed_through_to_background(self, runner, cli):
+        """AC#1: --provider gemini is passed to run_sandbox_background."""
+        with patch("sandbox_cli.get_repo_root", return_value=Path("/tmp/repo")), \
+             patch("sandbox_cli.get_main_git_dir", return_value=Path("/tmp/repo/.git")), \
+             patch("sandbox_cli.build_template_if_exists", return_value="test-image"), \
+             patch("sandbox_cli.run_sandbox_background") as mock_bg:
+            mock_bg.return_value = {"container": "c", "name": "n", "branch": "n", "exitCode": 0}
+            result = runner.invoke(cli, ["start", "foo", "--task", "do it", "--provider", "gemini"])
+        assert result.exit_code == 0
+        assert mock_bg.call_args.kwargs.get("provider") == "gemini"
+
+    def test_gemini_without_task_exits_with_error(self, runner, cli):
+        """AC#3: --provider gemini without --task exits with error."""
+        with patch("sandbox_cli.get_repo_root", return_value=Path("/tmp/repo")):
+            result = runner.invoke(cli, ["start", "foo", "--provider", "gemini"])
+        assert result.exit_code != 0
+        assert "background task mode" in result.output.lower() or "background" in result.output.lower()
+
+    def test_gemini_continue_raises_usage_error(self):
+        """AC#4: --continue with gemini provider raises UsageError via build_resume_cmd."""
+        provider = get_provider("gemini")
+        with pytest.raises(click.UsageError, match="Gemini provider does not support --continue"):
+            provider["build_resume_cmd"](None, Path("/worktree"))
+
+    def test_gemini_error_message_uses_provider_name(self, tmp_path):
+        """AC#11: Error message uses 'gemini exited with code {exit_code}'."""
+        from unittest.mock import MagicMock, patch
+        from sandbox_cli import run_sandbox_background
+
+        with patch("sandbox_cli.run") as mock_run, \
+             patch("sandbox_cli.container_exists", return_value=False), \
+             patch("sandbox_cli.branch_exists", return_value=False), \
+             patch("sandbox_cli.git_worktree_add", return_value=True), \
+             patch("sandbox_cli.copy_env_files", return_value=[]), \
+             patch("sandbox_cli.docker_container_rm", return_value=True), \
+             patch("sandbox_cli.git_worktree_remove", return_value=True), \
+             patch.dict("os.environ", {"GEMINI_API_KEY": "my-key"}, clear=False):
+
+            def run_side_effect(cmd, **kwargs):
+                cmd_str = " ".join(cmd)
+                if "rev-parse" in cmd_str and "HEAD" in cmd_str:
+                    return MagicMock(returncode=0, stdout="abc123\n")
+                if "docker run" in cmd_str:
+                    return MagicMock(returncode=0, stdout="cid\n")
+                if "docker wait" in cmd_str:
+                    return MagicMock(returncode=0, stdout="1\n")
+                if "docker logs" in cmd_str:
+                    return MagicMock(returncode=0, stdout="")
+                if "status" in cmd_str and "--porcelain" in cmd_str:
+                    return MagicMock(returncode=0, stdout="")
+                if "add" in cmd_str:
+                    return MagicMock(returncode=0, stdout="")
+                if "reset" in cmd_str:
+                    return MagicMock(returncode=0, stdout="")
+                return MagicMock(returncode=0, stdout="")
+
+            mock_run.side_effect = run_side_effect
+            with patch("sandbox_cli.get_gh_token", return_value="tok"):
+                result = run_sandbox_background(
+                    name="test", repo_root=tmp_path, repo_name="myrepo",
+                    main_git=tmp_path / ".git",
+                    image="test-image", task="do it", logs_dir=tmp_path / "logs",
+                    provider="gemini",
+                )
+
+        assert "error" in result
+        assert "gemini" in result["error"].lower()
+        assert "1" in result["error"]
+
+    def test_gemini_state_includes_provider(self, tmp_path):
+        """AC#9: state file includes 'provider': 'gemini'."""
+        from unittest.mock import MagicMock, patch
+        from sandbox_cli import run_sandbox_background
+
+        logs_dir = tmp_path / "logs"
+        state_captured = {}
+
+        with patch("sandbox_cli.run") as mock_run, \
+             patch("sandbox_cli.container_exists", return_value=False), \
+             patch("sandbox_cli.branch_exists", return_value=False), \
+             patch("sandbox_cli.git_worktree_add", return_value=True), \
+             patch("sandbox_cli.copy_env_files", return_value=[]), \
+             patch("sandbox_cli.docker_container_rm", return_value=True), \
+             patch("sandbox_cli.git_worktree_remove", return_value=True), \
+             patch.dict("os.environ", {"GEMINI_API_KEY": "my-key"}, clear=False):
+
+            def run_side_effect(cmd, **kwargs):
+                cmd_str = " ".join(cmd)
+                if "docker run" in cmd_str:
+                    state_file = logs_dir / "sandbox-myrepo-test.json"
+                    if state_file.exists():
+                        state_captured.update(json.loads(state_file.read_text()))
+                    return MagicMock(returncode=0, stdout="cid\n")
+                if "rev-parse" in cmd_str and "HEAD" in cmd_str:
+                    return MagicMock(returncode=0, stdout="abc123\n")
+                if "docker wait" in cmd_str:
+                    return MagicMock(returncode=0, stdout="0\n")
+                if "docker logs" in cmd_str:
+                    return MagicMock(returncode=0, stdout='{"response": "done"}\n')
+                if "status" in cmd_str and "--porcelain" in cmd_str:
+                    return MagicMock(returncode=0, stdout="")
+                if "add" in cmd_str:
+                    return MagicMock(returncode=0, stdout="")
+                if "reset" in cmd_str:
+                    return MagicMock(returncode=0, stdout="")
+                if "rev-parse" in cmd_str:
+                    return MagicMock(returncode=0, stdout="def456\n")
+                return MagicMock(returncode=0, stdout="")
+
+            mock_run.side_effect = run_side_effect
+            with patch("sandbox_cli.get_gh_token", return_value="tok"):
+                result = run_sandbox_background(
+                    name="test", repo_root=tmp_path, repo_name="myrepo",
+                    main_git=tmp_path / ".git",
+                    image="test-image", task="do it", logs_dir=logs_dir,
+                    provider="gemini",
+                )
+
+        assert state_captured.get("provider") == "gemini"
+        assert result.get("provider") == "gemini"

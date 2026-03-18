@@ -15,7 +15,7 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | d
     && apt-get update && apt-get install -y gh && rm -rf /var/lib/apt/lists/*
 
 # Install global npm packages
-RUN npm install -g @anthropic-ai/claude-code@latest @openai/codex@latest pnpm
+RUN npm install -g @anthropic-ai/claude-code@latest @openai/codex@latest @google/gemini-cli@latest pnpm
 
 # Install Playwright system dependencies
 RUN npx playwright install-deps
