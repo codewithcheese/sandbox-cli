@@ -6,8 +6,15 @@ from pathlib import Path
 import pytest
 
 # Skip all tests if Docker is not available
+def _docker_available():
+    try:
+        return subprocess.run(["docker", "info"], capture_output=True).returncode == 0
+    except FileNotFoundError:
+        return False
+
+
 pytestmark = pytest.mark.skipif(
-    subprocess.run(["docker", "info"], capture_output=True).returncode != 0,
+    not _docker_available(),
     reason="Docker not available"
 )
 
