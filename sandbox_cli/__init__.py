@@ -112,6 +112,33 @@ def extract_response(log_path: Path) -> str | None:
     return None
 
 
+def extract_codex_response(worktree_path: Path, log_path: Path) -> str | None:
+    """Extract response text from Codex output.
+
+    1. Check if <worktree_path>/.sandbox-result.txt exists. If so, read and return its contents.
+    2. Fall back to reading log_path. Return the last non-empty, non-JSON line.
+    3. Return None if neither has content.
+    """
+    result_file = worktree_path / ".sandbox-result.txt"
+    if result_file.exists():
+        content = result_file.read_text().strip()
+        if content:
+            return content
+
+    if log_path.exists():
+        for line in reversed(log_path.read_text().splitlines()):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                json.loads(line)
+                continue  # skip JSON lines
+            except (json.JSONDecodeError, ValueError):
+                return line
+
+    return None
+
+
 def parse_diff_stats(numstat: str) -> dict:
     """Parse git diff --numstat output into structured stats."""
     files = 0
@@ -318,6 +345,67 @@ def get_gh_token() -> str:
     return ""
 
 
+def get_provider(name: str) -> dict:
+    """Return provider config dict for the given provider name.
+
+    Raises click.UsageError for unknown providers.
+    """
+    if name == "claude":
+        return {
+            "name": "claude",
+            "build_cmd": lambda task, model, worktree_path: [
+                "claude", "-p", task, "--print", "--verbose",
+                "--output-format", "stream-json", "--dangerously-skip-permissions",
+                *(["--model", model] if model else []),
+            ],
+            "build_resume_cmd": lambda model, worktree_path: [
+                "claude", "--continue", "--print", "--verbose",
+                "--output-format", "stream-json", "--dangerously-skip-permissions",
+                *(["--model", model] if model else []),
+            ],
+            "env_vars": lambda: [
+                f"CLAUDE_CODE_OAUTH_TOKEN={get_auth_token()}",
+                f"GH_TOKEN={get_gh_token()}",
+            ],
+            "volume_mounts": lambda home: [
+                f"{home}/.ssh:/home/agent/.ssh:ro",
+                f"{home}/.config/gh:/home/agent/.config/gh:ro",
+                "pnpm-store:/pnpm-store",
+            ],
+            "extract_response": lambda worktree_path, log_path: extract_response(log_path),
+            "auth_check": lambda: None if get_auth_token() else
+                "No auth token configured. Run: claude setup-token && sandbox auth <token>",
+        }
+    elif name == "codex":
+        return {
+            "name": "codex",
+            "build_cmd": lambda task, model, worktree_path: [
+                "codex", "exec", "--yolo",
+                "-o", str(worktree_path / ".sandbox-result.txt"),
+                *(["--model", model] if model else []),
+                task,
+            ],
+            "build_resume_cmd": lambda model, worktree_path: (_ for _ in ()).throw(
+                click.UsageError("Codex provider does not support --continue")
+            ),
+            "env_vars": lambda: [
+                "CODEX_HOME=/home/agent/.codex",
+                f"GH_TOKEN={get_gh_token()}",
+            ],
+            "volume_mounts": lambda home: [
+                f"{home}/.codex:/home/agent/.codex",
+                f"{home}/.ssh:/home/agent/.ssh:ro",
+                f"{home}/.config/gh:/home/agent/.config/gh:ro",
+                "pnpm-store:/pnpm-store",
+            ],
+            "extract_response": extract_codex_response,
+            "auth_check": lambda: None if (Path.home() / ".codex" / "auth.json").exists() else
+                "No Codex auth found. Run: codex login",
+        }
+    else:
+        raise click.UsageError(f"Unknown provider: {name}. Choose from: claude, codex")
+
+
 def find_available_ports(count: int = 3, start: int = 49152, end: int = 65535) -> list[int]:
     """Find available ports in the dynamic/private port range."""
     import socket
@@ -358,6 +446,7 @@ def run_sandbox_background(
     push: bool = False,
     cleanup: bool = False,
     continue_session: bool = False,
+    provider: str = "claude",
 ) -> dict:
     """Run a sandbox task in background mode. Returns result dict."""
     sb = resolve_sandbox(repo_root, name, logs_dir=logs_dir, repo_name=repo_name)
@@ -372,19 +461,34 @@ def run_sandbox_background(
         if not container_exists(container_name):
             return {**error_result, "error": f"No container to resume: {container_name}"}
 
+        # Load provider from state file (overrides CLI flag)
+        state_provider = "claude"
+        if log_file.exists():
+            try:
+                state = json.loads(log_file.read_text())
+                state_provider = state.get("provider", "claude")
+            except (json.JSONDecodeError, OSError):
+                pass
+        if provider != state_provider:
+            click.echo(
+                f"Warning: --provider flag ignored for --continue; "
+                f"using provider from state file: {state_provider}",
+                err=True,
+            )
+
+        resume_provider = get_provider(state_provider)
+
         base_result = run(["git", "-C", str(worktree_path), "rev-parse", "HEAD"])
         base_commit = base_result.stdout.strip()
 
-        claude_cmd = ["claude", "--continue", "--print", "--verbose", "--output-format", "stream-json", "--dangerously-skip-permissions"]
-        if model:
-            claude_cmd.extend(["--model", model])
+        agent_cmd = resume_provider["build_resume_cmd"](model, worktree_path)
 
         # Start container if stopped, then exec
         if not container_running(container_name):
             run(["docker", "start", container_name])
-        exec_result = run(["docker", "exec", container_name] + claude_cmd)
+        exec_result = run(["docker", "exec", container_name] + agent_cmd)
 
-        result = _collect_and_finalize(sb, exec_result.returncode, base_commit, repo_root, name, push=push, cleanup=cleanup)
+        result = _collect_and_finalize(sb, exec_result.returncode, base_commit, repo_root, name, push=push, cleanup=cleanup, provider=resume_provider)
         return result
 
     # New task: check for conflicts
@@ -396,6 +500,12 @@ def run_sandbox_background(
         return {**error_result, "error": f"Worktree already exists: {worktree_path}"}
     if log_file.exists():
         return {**error_result, "error": f"Log file already exists: {log_file}"}
+
+    # Auth check BEFORE worktree creation (fail fast without needing cleanup)
+    task_provider = get_provider(provider)
+    auth_error = task_provider["auth_check"]()
+    if auth_error:
+        return {**error_result, "error": auth_error}
 
     # Create worktree
     if not git_worktree_add(worktree_path, name, new_branch=True):
@@ -409,6 +519,7 @@ def run_sandbox_background(
     logs_dir.mkdir(parents=True, exist_ok=True)
     state = {
         "status": "running",
+        "provider": provider,
         "container": container_name,
         "name": sname,
         "branch": name,
@@ -422,30 +533,23 @@ def run_sandbox_background(
 
     # Launch container detached
     home = Path.home()
-    claude_cmd = ["claude", "-p", task, "--print", "--verbose", "--output-format", "stream-json", "--dangerously-skip-permissions"]
-    if model:
-        claude_cmd.extend(["--model", model])
-
-    auth_token = get_auth_token()
-    if not auth_token:
-        git_worktree_remove(worktree_path, force=True)
-        run(["git", "branch", "-D", name])
-        log_file.unlink(missing_ok=True)
-        return {**error_result, "error": "No auth token configured. Run: claude setup-token && sandbox auth <token>"}
+    agent_cmd = task_provider["build_cmd"](task, model, worktree_path)
 
     docker_cmd = [
         "docker", "run", "-d",
         "--name", container_name,
         "-v", f"{worktree_path}:{worktree_path}",
         "-v", f"{main_git}:{main_git}",
-        "-v", f"{home}/.ssh:/home/agent/.ssh:ro",
-        "-v", f"{home}/.config/gh:/home/agent/.config/gh:ro",
-        "-v", "pnpm-store:/pnpm-store",
-        "-e", f"CLAUDE_CODE_OAUTH_TOKEN={auth_token}",
-        "-e", f"GH_TOKEN={get_gh_token()}",
+    ]
+    for mount in task_provider["volume_mounts"](home):
+        docker_cmd.extend(["-v", mount])
+    for env_var in task_provider["env_vars"]():
+        docker_cmd.extend(["-e", env_var])
+    docker_cmd.extend([
         "-w", str(worktree_path),
         image,
-    ] + claude_cmd
+    ])
+    docker_cmd.extend(agent_cmd)
 
     launch = run(docker_cmd)
     if launch.returncode != 0:
@@ -461,13 +565,15 @@ def run_sandbox_background(
     except (ValueError, AttributeError):
         exit_code = 1
 
-    result = _collect_and_finalize(sb, exit_code, base_commit, repo_root, name, push=push, cleanup=cleanup)
+    result = _collect_and_finalize(sb, exit_code, base_commit, repo_root, name, push=push, cleanup=cleanup, provider=task_provider)
     return result
 
 
 def _collect_and_finalize(sb: dict, exit_code: int, base_commit: str, repo_root: Path, name: str,
-                          push: bool = False, cleanup: bool = False) -> dict:
+                          push: bool = False, cleanup: bool = False, provider: dict | None = None) -> dict:
     """Shared post-wait finalization: save logs, commit, optionally push/cleanup, build result."""
+    if provider is None:
+        provider = get_provider("claude")
     container_name = sb["container"]
     sname = sb["sname"]
     worktree_path = sb["worktree"]
@@ -482,7 +588,7 @@ def _collect_and_finalize(sb: dict, exit_code: int, base_commit: str, repo_root:
     commit_succeeded = False
     nothing_to_commit = False
     run(["git", "-C", str(worktree_path), "add", "-A"])
-    run(["git", "-C", str(worktree_path), "reset", "HEAD", "--", ".env*"])
+    run(["git", "-C", str(worktree_path), "reset", "HEAD", "--", ".env*", ".sandbox-result.txt"])
 
     status = run(["git", "-C", str(worktree_path), "status", "--porcelain"])
     if not status.stdout.strip():
@@ -513,8 +619,8 @@ def _collect_and_finalize(sb: dict, exit_code: int, base_commit: str, repo_root:
     if cleanup and commit_succeeded:
         git_worktree_remove(worktree_path, force=True)
 
-    # Extract response text
-    response = extract_response(sb["log_raw"])
+    # Extract response text via provider
+    response = provider["extract_response"](worktree_path, sb["log_raw"])
 
     result = {
         "container": container_name,
@@ -523,6 +629,7 @@ def _collect_and_finalize(sb: dict, exit_code: int, base_commit: str, repo_root:
         "exitCode": exit_code,
         "worktreePath": str(worktree_path),
         "modifiedFiles": modified_files,
+        "provider": provider["name"],
     }
 
     result["pushed"] = pushed
@@ -539,7 +646,7 @@ def _collect_and_finalize(sb: dict, exit_code: int, base_commit: str, repo_root:
         result["response"] = response
 
     if exit_code != 0:
-        result["error"] = f"Claude exited with code {exit_code}"
+        result["error"] = f"{provider['name']} exited with code {exit_code}"
 
     if not commit_succeeded and not nothing_to_commit:
         result["error"] = f"Commit failed, worktree preserved at {worktree_path}"
@@ -627,7 +734,8 @@ COMMANDS:
            <name>                  Sandbox name (auto-generated if omitted)
            --task <prompt>         Run as background task (non-interactive)
            --task-file <path>      Read prompt from file (mutually exclusive with --task)
-           --model <model>         Model to pass to Claude (e.g. haiku, sonnet)
+           --model <model>         Model to pass to the agent (e.g. haiku, sonnet, gpt-4.1)
+           --provider <name>       Agent provider: claude (default) or codex (background only)
            --push                  Push branch to origin after successful commit
            --cleanup               Remove worktree after completion
            Interactive: launches Docker container with Claude CLI
@@ -756,10 +864,13 @@ def auth(token):
 @click.option("--continue", "continue_session", is_flag=True, help="Resume a crashed background task.")
 @click.option("--task", default=None, help="Run in background mode with this prompt.")
 @click.option("--task-file", default=None, type=click.Path(exists=True), help="Read prompt from file.")
-@click.option("--model", default=None, help="Model to pass to Claude.")
+@click.option("--model", default=None, help="Model to pass to the agent CLI.")
 @click.option("--push", is_flag=True, help="Push branch to origin after successful commit.")
 @click.option("--cleanup", is_flag=True, help="Remove worktree and container after completion.")
-def start(name, continue_session, task, task_file, model, push, cleanup):
+@click.option("--provider", "provider", default="claude",
+              type=click.Choice(["claude", "codex"]),
+              help="Agent provider to use for background tasks (default: claude).")
+def start(name, continue_session, task, task_file, model, push, cleanup, provider):
     """Start a sandbox (creates if new, resumes if exists)."""
     if continue_session and (task or task_file):
         click.echo("Cannot specify both --continue and --task/--task-file", err=True)
@@ -778,6 +889,11 @@ def start(name, continue_session, task, task_file, model, push, cleanup):
 
     if continue_session and not name:
         click.echo("--continue requires a sandbox name", err=True)
+        sys.exit(1)
+
+    # Codex only supports background task mode
+    if provider == "codex" and not task and not task_file and not continue_session:
+        click.echo("Codex provider only supports background task mode", err=True)
         sys.exit(1)
 
     if not name:
@@ -805,6 +921,7 @@ def start(name, continue_session, task, task_file, model, push, cleanup):
             push=push,
             cleanup=cleanup,
             continue_session=continue_session,
+            provider=provider,
         )
         click.echo(json.dumps(result))
         return
@@ -911,6 +1028,7 @@ def read(name):
             return
         # Running state file — try to recover
         base_commit = data.get("baseCommit", "")
+        state_provider_name = data.get("provider", "claude")
         if not container_exists(container_name):
             click.echo(json.dumps({"error": "Task was running but container is gone"}))
             return
@@ -929,14 +1047,17 @@ def read(name):
         except (ValueError, AttributeError):
             exit_code = 1
 
-        # Get base_commit from state file if available
+        # Get base_commit and provider from state file if available
         if not result_path.exists():
             base_commit = ""
+            state_provider_name = "claude"
         elif "base_commit" not in dir():
             state = json.loads(result_path.read_text())
             base_commit = state.get("baseCommit", "")
+            state_provider_name = state.get("provider", "claude")
 
-        result = _collect_and_finalize(sb, exit_code, base_commit, repo_root, name)
+        provider = get_provider(state_provider_name)
+        result = _collect_and_finalize(sb, exit_code, base_commit, repo_root, name, provider=provider)
         click.echo(json.dumps(result))
         return
 

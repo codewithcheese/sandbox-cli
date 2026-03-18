@@ -9,7 +9,10 @@ import pytest
 
 
 def _docker_available():
-    return subprocess.run(["docker", "info"], capture_output=True).returncode == 0
+    try:
+        return subprocess.run(["docker", "info"], capture_output=True).returncode == 0
+    except FileNotFoundError:
+        return False
 
 
 def _claude_authenticated():
