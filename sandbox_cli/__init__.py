@@ -652,6 +652,10 @@ COMMANDS:
   ports    Show available ports for a sandbox
            <name>                  Sandbox name
 
+  docs     Show documentation guides
+           prompt-guide            How to write sandbox task prompts
+           operations-guide        Running sandboxes, integrating results, failure modes
+
 OUTPUT (background mode):
   All results include: container, name, branch, exitCode, worktreePath, modifiedFiles
   On commit:  + response, diffStats, commitSha
@@ -659,12 +663,15 @@ OUTPUT (background mode):
   On failure: + error
   All progress goes to stderr. Only final JSON goes to stdout.
 
-USAGE WITH CLAUDE CODE:
+INSTRUCTIONS FOR CLAUDE:
+  Before first use, read the operations guide:  sandbox docs operations-guide
+  Before writing a task prompt, read the prompt guide:  sandbox docs prompt-guide
+
   Run background tasks with run_in_background. They block until complete,
   so you will be notified when done. Do NOT poll or sleep.
 
   Workflow:
-    1. sandbox start proto-1 --task "implement the auth module" --model sonnet
+    1. sandbox start proto-1 --task-file prompts/proto-1.md --model sonnet
     2. Notified with JSON result containing worktreePath and modifiedFiles
     3. Read the changes from worktreePath to review the work
     4. sandbox rm proto-1 --yes  (when done, cleans up worktree + branch)
@@ -1183,6 +1190,34 @@ def post_exit(name, repo_name):
                 click.echo(f"Failed to delete branch: {result.stderr}", err=True)
 
 
+
+
+DOCS = {
+    "prompt-guide": "How to write sandbox task prompts",
+    "operations-guide": "Running sandboxes, integrating results, failure modes",
+}
+
+
+@cli.command()
+@click.argument("name", required=False)
+def docs(name):
+    """Show documentation guides."""
+    docs_dir = Path(__file__).parent / "docs"
+    if name is None:
+        click.echo("Available guides:\n")
+        for doc_name, desc in DOCS.items():
+            click.echo(f"  {doc_name:25s} {desc}")
+        click.echo(f"\nUsage: sandbox docs <name>")
+        return
+    if name not in DOCS:
+        click.echo(f"Unknown guide: {name}", err=True)
+        click.echo(f"Available: {', '.join(DOCS.keys())}", err=True)
+        sys.exit(1)
+    doc_path = docs_dir / f"{name}.md"
+    if not doc_path.exists():
+        click.echo(f"Guide file not found: {doc_path}", err=True)
+        sys.exit(1)
+    click.echo_via_pager(doc_path.read_text())
 
 
 if __name__ == "__main__":

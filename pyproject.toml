@@ -12,7 +12,7 @@ dependencies = [
 sandbox = "sandbox_cli:cli"
 
 [tool.setuptools.package-data]
-sandbox_cli = ["Dockerfile", "scripts/*"]
+sandbox_cli = ["Dockerfile", "scripts/*", "docs/*.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
