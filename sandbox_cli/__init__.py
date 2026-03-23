@@ -413,8 +413,10 @@ def get_provider(name: str) -> dict:
             "env_vars": lambda: [
                 f"CLAUDE_CODE_OAUTH_TOKEN={get_auth_token()}",
                 f"GH_TOKEN={get_gh_token()}",
+                "CLAUDE_CONFIG_DIR=/home/agent/.claude",
             ],
             "volume_mounts": lambda home: [
+                f"{home}/.claude:/home/agent/.claude",
                 f"{home}/.ssh:/home/agent/.ssh:ro",
                 f"{home}/.config/gh:/home/agent/.config/gh:ro",
                 "pnpm-store:/pnpm-store",
@@ -998,15 +1000,13 @@ def run_sandbox_remote(
 
 
 def run_sandbox(name: str, repo_name: str, main_git: Path, worktree_path: Path, template: str | None = None, extra_mounts: list[str] | None = None) -> None:
-    """Output sandbox run command for shell wrapper to execute."""
+    """Launch interactive sandbox session, then start cleanup Claude on exit."""
     home = Path.home()
     image = template or ensure_default_image()
     container_name = f"sandbox-{repo_name}-{name}"
+    repo_root = main_git.parent
 
     claude_cmd = ["claude", "--dangerously-skip-permissions"]
-
-    # Will be set after ports are determined for new containers
-    ports_prompt = None
 
     # Check if container already exists - session lives in the container
     if container_exists(container_name):
@@ -1015,10 +1015,27 @@ def run_sandbox(name: str, repo_name: str, main_git: Path, worktree_path: Path, 
             # Exec into running container
             cmd_parts = ["docker", "exec", "-it", container_name] + claude_cmd
         else:
-            # Start stopped container and exec
-            cmd_parts = ["docker", "start", container_name, "&&",
-                        "docker", "exec", "-it", container_name] + claude_cmd
+            # Start stopped container, then exec
+            run(["docker", "start", container_name], capture=False)
+            cmd_parts = ["docker", "exec", "-it", container_name] + claude_cmd
     else:
+        # Build .claude.json from host config, overlaying sandbox requirements
+        import tempfile
+        host_claude_json = home / ".claude.json"
+        claude_json = json.loads(host_claude_json.read_text()) if host_claude_json.exists() else {}
+        claude_json["hasCompletedOnboarding"] = True
+        projects = claude_json.setdefault("projects", {})
+        projects[str(worktree_path)] = {
+            **projects.get(str(worktree_path), {}),
+            "hasTrustDialogAccepted": True,
+            "hasCompletedProjectOnboarding": True,
+        }
+        claude_json_file = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", prefix="claude-sandbox-", delete=False
+        )
+        json.dump(claude_json, claude_json_file)
+        claude_json_file.close()
+
         # Create new container - fresh session
         cmd_parts = [
             "docker", "run", "-it",
@@ -1026,7 +1043,9 @@ def run_sandbox(name: str, repo_name: str, main_git: Path, worktree_path: Path, 
             "-v", f"{worktree_path}:{worktree_path}",
             "-v", f"{main_git}:{main_git}",
             "-v", f"{home}/.claude:/home/agent/.claude",
+            "-v", f"{claude_json_file.name}:/home/agent/.claude.json",
             "-v", f"{home}/.config/gh:/home/agent/.config/gh:ro",
+            "-e", f"CLAUDE_CODE_OAUTH_TOKEN={get_auth_token()}",
             "-e", f"GH_TOKEN={get_gh_token()}",
             "-e", "CLAUDE_CONFIG_DIR=/home/agent/.claude",
             "-e", "FORCE_COLOR=1",
@@ -1041,26 +1060,74 @@ def run_sandbox(name: str, repo_name: str, main_git: Path, worktree_path: Path, 
         ports = find_available_ports(3)
         for port in ports:
             cmd_parts.extend(["-p", f"{port}:{port}"])
+        ports_prompt = f"You are running in a sandbox. Available ports for dev servers: {', '.join(map(str, ports))}. When starting dev servers, use --port {ports[0]} --host 0.0.0.0 (host binding required for port forwarding)."
         cmd_parts.extend([
             "-e", f"SANDBOX_PORTS={','.join(map(str, ports))}",
             "-w", str(worktree_path),
             image,
         ])
         cmd_parts.extend(claude_cmd)
-        ports_prompt = f"You are running in a sandbox. Available ports for dev servers: {', '.join(map(str, ports))}. When starting dev servers, use --port {ports[0]} --host 0.0.0.0 (host binding required for port forwarding)."
-        cmd_parts.extend(["--append-system-prompt", f"'{ports_prompt}'"])
+        cmd_parts.extend(["--append-system-prompt", ports_prompt])
 
-    # To wrap with VibeTunnel for session monitoring, uncomment:
-    # import os
-    # vt_check = run(["which", "vt"])
-    # if vt_check.returncode == 0 and not os.environ.get("VIBETUNNEL_SESSION_ID"):
-    #     cmd_parts = ["vt"] + cmd_parts
+    # Fork so child gets PTY via execvp (clean signal handling), parent waits for cleanup
+    import signal
+    pid = os.fork()
+    if pid == 0:
+        os.execvp(cmd_parts[0], cmd_parts)
+    else:
+        # Parent ignores SIGINT — only docker/claude should handle ctrl-C
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        _, status = os.waitpid(pid, 0)
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
 
-    # Output for shell wrapper: CD and EXEC directives
-    print(f"__SANDBOX_CD__:{worktree_path}")
-    print(f"__SANDBOX_EXEC__:{' '.join(cmd_parts)}")
-    print(f"__SANDBOX_NAME__:{name}")
-    print(f"__SANDBOX_REPO__:{repo_name}")
+    # Gather worktree status: uncommitted changes + committed changes vs main
+    status_result = run(["git", "-C", str(worktree_path), "status", "--short"])
+    log_result = run(["git", "-C", str(worktree_path), "log", "main.." + name, "--oneline"])
+    diff_stat_result = run(["git", "-C", str(worktree_path), "diff", "--stat", "main.." + name])
+    uncommitted = status_result.stdout.strip()
+    commits = log_result.stdout.strip()
+    diff_stats = diff_stat_result.stdout.strip()
+
+    has_changes = uncommitted or commits
+
+    if not has_changes:
+        # No changes — clean up silently
+        click.echo("No changes detected, cleaning up...", err=True)
+        docker_container_rm(container_name)
+        git_worktree_remove(worktree_path, force=True)
+        run(["git", "branch", "-D", name])
+        click.echo(f"Sandbox {name} removed.", err=True)
+        return
+
+    # Build a summary for Claude
+    summary_parts = []
+    if commits:
+        summary_parts.append(f"Commits:\n{commits}")
+    if diff_stats:
+        summary_parts.append(f"Diff stats:\n{diff_stats}")
+    if uncommitted:
+        summary_parts.append(f"Uncommitted:\n{uncommitted}")
+    summary = "\n\n".join(summary_parts)
+
+    # Changes exist — launch Claude for integration
+    cleanup_prompt = f"""\
+Sandbox "{name}" has changes to integrate. Present the summary below, then \
+merge into main. Do NOT run git diff or git log — everything you need is here.
+
+{summary}
+
+Your job:
+1. Present the summary above to the user.
+2. Ask: merge into main, or create a PR? (Two options only.)
+3. If there are uncommitted changes, commit them first:
+   git -C {worktree_path} add -A && git -C {worktree_path} commit -m "<summarize all changes on the branch>"
+4. To merge: cd {repo_root} && git merge {name} --no-ff
+   To PR: git -C {worktree_path} push -u origin {name} && gh pr create
+5. After integration, clean up automatically — no confirmation needed:
+   docker rm -f {container_name}
+   git worktree remove {worktree_path}
+   git branch -D {name}"""
+    os.execvp("claude", ["claude", cleanup_prompt])
 
 
 HELP_TEXT = """\
@@ -1247,6 +1314,12 @@ def start(name, continue_session, task, task_file, model, push, cleanup, provide
         click.echo("--continue requires a sandbox name", err=True)
         sys.exit(1)
 
+    if not get_auth_token():
+        click.echo("No auth token configured.", err=True)
+        click.echo("Run: claude setup-token", err=True)
+        click.echo("Then: sandbox auth <token>", err=True)
+        sys.exit(1)
+
     # Codex and Gemini only support background task mode
     if provider in ("codex", "gemini") and not task and not task_file and not continue_session:
         click.echo(f"{provider.capitalize()} provider only supports background task mode", err=True)
@@ -1371,6 +1444,31 @@ def start(name, continue_session, task, task_file, model, push, cleanup, provide
 
         click.echo(f"Created sandbox: {sname}", err=True)
         run_sandbox(sname, repo_name, main_git, worktree_path, template=template, extra_mounts=list(extra_mounts))
+
+
+@cli.command()
+@click.argument("name")
+def join(name):
+    """Join a running sandbox with a new Claude session."""
+    repo_root = get_repo_root()
+    if not repo_root:
+        click.echo("Not in a git repository", err=True)
+        sys.exit(1)
+
+    sname = safe_name(name)
+    repo_name = repo_root.name
+    container_name = f"sandbox-{repo_name}-{sname}"
+
+    if not container_exists(container_name):
+        click.echo(f"No sandbox found: {sname}", err=True)
+        sys.exit(1)
+
+    if not container_running(container_name):
+        click.echo(f"Sandbox is not running: {sname}", err=True)
+        sys.exit(1)
+
+    cmd_parts = ["docker", "exec", "-it", container_name, "claude", "--dangerously-skip-permissions"]
+    os.execvp(cmd_parts[0], cmd_parts)
 
 
 @cli.command()
