@@ -382,7 +382,10 @@ def build_template_if_exists(repo_root: Path) -> str:
 
 
 def get_gh_token() -> str:
-    """Get GitHub token from gh CLI."""
+    """Get GitHub token: $GH_TOKEN env var first, then gh CLI fallback."""
+    token = os.environ.get("GH_TOKEN", "").strip()
+    if token:
+        return token
     result = run(["gh", "auth", "token"])
     if result.returncode == 0:
         return result.stdout.strip()
@@ -737,6 +740,263 @@ def _collect_and_finalize(sb: dict, exit_code: int, base_commit: str, repo_root:
     return result
 
 
+def get_modal_image():
+    """Build (or return cached) Modal image with Node.js, Claude Code, Codex, and Gemini CLI."""
+    try:
+        import modal
+    except ImportError:
+        click.echo("modal package not installed. Run: pip install modal", err=True)
+        sys.exit(1)
+    return (
+        modal.Image.debian_slim(python_version="3.12")
+        .apt_install("ca-certificates", "curl", "git", "jq", "build-essential")
+        .run_commands(
+            # Install Node.js 20
+            "curl -fsSL https://deb.nodesource.com/setup_20.x | bash -",
+            "apt-get install -y nodejs",
+            # Install Claude Code and agent CLIs
+            "npm install -g @anthropic-ai/claude-code @openai/codex @google/gemini-cli",
+        )
+    )
+
+
+def run_sandbox_remote(
+    name: str,
+    repo_root: Path,
+    repo_name: str,
+    task: str,
+    logs_dir: Path,
+    model: str | None = None,
+    provider: str = "claude",
+) -> dict:
+    """Run a background sandbox task on Modal. Returns result dict."""
+    import re
+
+    # Lazy import Modal — only required when --remote is used
+    try:
+        import modal
+        from modal.exception import (
+            ExecTimeoutError,
+            NotFoundError,
+            SandboxTerminatedError,
+            SandboxTimeoutError,
+        )
+    except ImportError:
+        return {"error": "modal package not installed. Run: pip install modal"}
+
+    sb_info = resolve_sandbox(repo_root, name, logs_dir=logs_dir, repo_name=repo_name)
+    sname = sb_info["sname"]
+    branch = name
+    log_json = sb_info["log_json"]
+    log_raw = sb_info["log_raw"]
+    error_result = {"name": sname, "branch": branch, "runtime": "modal"}
+
+    # --- Auth checks ---
+    # 1. Modal authentication
+    try:
+        app = modal.App.lookup("sandbox-cli", create_if_missing=True)
+    except Exception as exc:
+        return {**error_result, "error": f"Modal auth failed: {exc}. Run: modal setup"}
+
+    # 2. Provider auth
+    task_provider = get_provider(provider)
+    auth_error = task_provider["auth_check"]()
+    if auth_error:
+        return {**error_result, "error": auth_error}
+
+    # 3. GH_TOKEN required for clone/push
+    gh_token = get_gh_token()
+    if not gh_token:
+        return {**error_result, "error": "GH_TOKEN is required for --remote. Set $GH_TOKEN or run: gh auth login"}
+
+    # --- Existing remote branch check ---
+    if log_json.exists():
+        return {**error_result, "error": f"State file already exists: {log_json}"}
+
+    # Fetch and check remote branch
+    run(["git", "fetch", "--quiet"])
+    if run(["git", "show-ref", "--verify", "--quiet", f"refs/remotes/origin/{branch}"]).returncode == 0:
+        return {**error_result, "error": f"Remote branch already exists: {branch}"}
+
+    # --- Resolve repo URL ---
+    remote_url_result = run(["git", "remote", "get-url", "origin"])
+    if remote_url_result.returncode != 0:
+        return {**error_result, "error": "Could not get git remote URL for origin"}
+    repo_url = remote_url_result.stdout.strip()
+
+    # --- Create remote branch (must succeed before sandbox creation) ---
+    push_result = run(["git", "push", "origin", f"HEAD:refs/heads/{branch}"])
+    if push_result.returncode != 0:
+        return {**error_result, "error": f"Failed to create remote branch: {push_result.stderr.strip()}"}
+
+    # --- Record base commit ---
+    base_commit_result = run(["git", "rev-parse", "HEAD"])
+    base_commit = base_commit_result.stdout.strip() if base_commit_result.returncode == 0 else ""
+
+    # --- Write initial state file ---
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    state = {
+        "status": "running",
+        "runtime": "modal",
+        "provider": provider,
+        "name": sname,
+        "branch": branch,
+        "sandboxId": None,
+        "baseCommit": base_commit,
+    }
+    log_json.write_text(json.dumps(state))
+
+    # --- Build provider command ---
+    worktree_path = Path("/workspace")
+    agent_cmd = task_provider["build_cmd"](task, model, worktree_path)
+
+    # --- Build secrets dict ---
+    secrets_dict: dict[str, str] = {"GH_TOKEN": gh_token}
+    if provider == "claude":
+        auth_token = get_auth_token()
+        if auth_token:
+            secrets_dict["CLAUDE_CODE_OAUTH_TOKEN"] = auth_token
+    elif provider == "gemini":
+        gemini_key = os.environ.get("GEMINI_API_KEY", "")
+        if gemini_key:
+            secrets_dict["GEMINI_API_KEY"] = gemini_key
+
+    # --- Get runner script path ---
+    runner_script = get_sandbox_cli_dir() / "scripts" / "modal_runner.sh"
+
+    sb = None
+    try:
+        # --- Create sandbox ---
+        image = get_modal_image()
+        sb = modal.Sandbox.create(
+            app=app,
+            image=image,
+            timeout=7200,
+            idle_timeout=600,
+            cpu=2.0,
+            memory=4096,
+            secrets=[modal.Secret.from_dict(secrets_dict)],
+        )
+
+        # Update state file with sandbox ID
+        state["sandboxId"] = sb.object_id
+        log_json.write_text(json.dumps(state))
+
+        click.echo(f"Modal sandbox created: {sb.object_id}", err=True)
+
+        # Upload runner script to sandbox
+        runner_content = runner_script.read_bytes()
+        with sb.open("/tmp/modal_runner.sh", "wb") as f:
+            f.write(runner_content)
+
+        # Build exec args: runner script + repo_url + branch + agent_cmd
+        exec_args = ["bash", "/tmp/modal_runner.sh", repo_url, branch] + agent_cmd
+
+        # --- Exec runner with pty=False for clean NDJSON output ---
+        proc = sb.exec(*exec_args, pty=False)
+
+        # --- Stream stdout: tee to terminal and write incrementally to log file ---
+        log_raw.parent.mkdir(parents=True, exist_ok=True)
+        captured_chunks = []
+        ansi_re = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]')
+
+        with log_raw.open("w", encoding="utf-8") as log_file:
+            for chunk in proc.stdout:
+                sys.stderr.write(chunk)
+                sys.stderr.flush()
+                log_file.write(chunk)
+                log_file.flush()
+                captured_chunks.append(chunk)
+
+        exit_code = proc.wait()
+
+    except SandboxTimeoutError:
+        exit_code = 1
+        result_error = "Modal sandbox timed out"
+        click.echo(f"Error: {result_error}", err=True)
+        result = {**error_result, "exitCode": exit_code, "error": result_error}
+        log_json.write_text(json.dumps(result))
+        return result
+    except SandboxTerminatedError:
+        exit_code = 1
+        result_error = "Modal sandbox terminated unexpectedly (possible OOM)"
+        click.echo(f"Error: {result_error}", err=True)
+        result = {**error_result, "exitCode": exit_code, "error": result_error}
+        log_json.write_text(json.dumps(result))
+        return result
+    except ExecTimeoutError:
+        exit_code = 1
+        result_error = "Modal exec timed out"
+        click.echo(f"Error: {result_error}", err=True)
+        result = {**error_result, "exitCode": exit_code, "error": result_error}
+        log_json.write_text(json.dumps(result))
+        return result
+    except Exception as exc:
+        exit_code = 1
+        result_error = f"Modal error: {exc}"
+        click.echo(f"Error: {result_error}", err=True)
+        result = {**error_result, "exitCode": exit_code, "error": result_error}
+        log_json.write_text(json.dumps(result))
+        return result
+    finally:
+        if sb is not None:
+            try:
+                sb.terminate(wait=True)
+            except Exception:
+                pass
+            try:
+                sb.detach()
+            except Exception:
+                pass
+
+    # --- Parse __SANDBOX_RESULT__ marker from captured output ---
+    full_log = "".join(captured_chunks)
+    sandbox_result: dict = {}
+    for line in full_log.splitlines():
+        clean = ansi_re.sub("", line)
+        if clean.startswith("__SANDBOX_RESULT__"):
+            payload = clean[len("__SANDBOX_RESULT__"):].strip()
+            try:
+                sandbox_result = json.loads(payload)
+            except (json.JSONDecodeError, ValueError):
+                pass
+
+    # --- Extract provider response from log file ---
+    response = task_provider["extract_response"](worktree_path, log_raw)
+
+    # --- Build result ---
+    result: dict = {
+        "name": sname,
+        "branch": branch,
+        "runtime": "modal",
+        "provider": provider,
+        "exitCode": sandbox_result.get("exitCode", exit_code),
+        "modifiedFiles": sandbox_result.get("modifiedFiles", []),
+        "pushed": sandbox_result.get("pushed", False),
+    }
+
+    commit_sha = sandbox_result.get("commitSha", "")
+    if commit_sha:
+        result["commitSha"] = commit_sha
+
+    diff_stats = sandbox_result.get("diffStats")
+    if diff_stats:
+        result["diffStats"] = diff_stats
+
+    if response:
+        result["response"] = response
+
+    if exit_code != 0:
+        result["error"] = sandbox_result.get("error") or f"{provider} exited with code {exit_code}"
+    elif sandbox_result.get("error"):
+        result["error"] = sandbox_result["error"]
+
+    # --- Write final state file ---
+    log_json.write_text(json.dumps(result))
+
+    return result
+
+
 def run_sandbox(name: str, repo_name: str, main_git: Path, worktree_path: Path, template: str | None = None, extra_mounts: list[str] | None = None) -> None:
     """Output sandbox run command for shell wrapper to execute."""
     home = Path.home()
@@ -821,8 +1081,10 @@ COMMANDS:
            --mount <host:dst[:ro]> Extra volume mount, repeatable
            --push                  Push branch to origin after successful commit
            --cleanup               Remove worktree after completion
+           --remote                Run background task on Modal (no local Docker required)
            Interactive: launches Docker container with Claude CLI
            Background:  commits changes, returns JSON to stdout
+           Remote:      clones repo inside Modal sandbox, pushes results from cloud
 
   read     Read results from a background task
            <name>                  Sandbox name (same as used with start)
@@ -955,8 +1217,17 @@ def auth(token):
               help="Agent provider to use for background tasks (default: claude).")
 @click.option("--mount", "extra_mounts", multiple=True,
               help="Extra volume mount (host:container[:ro]). Repeatable.")
-def start(name, continue_session, task, task_file, model, push, cleanup, provider, extra_mounts):
+@click.option("--remote", is_flag=True, help="Run background task on Modal instead of local Docker.")
+def start(name, continue_session, task, task_file, model, push, cleanup, provider, extra_mounts, remote):
     """Start a sandbox (creates if new, resumes if exists)."""
+    if remote and not (task or task_file):
+        click.echo("--remote only supports background task mode (use --task or --task-file)", err=True)
+        sys.exit(1)
+
+    if remote and continue_session:
+        click.echo("--remote is incompatible with --continue", err=True)
+        sys.exit(1)
+
     if continue_session and (task or task_file):
         click.echo("Cannot specify both --continue and --task/--task-file", err=True)
         sys.exit(1)
@@ -990,8 +1261,22 @@ def start(name, continue_session, task, task_file, model, push, cleanup, provide
         click.echo("Not in a git repository", err=True)
         sys.exit(1)
 
+    if remote and task:
+        # Remote (Modal) background mode
+        result = run_sandbox_remote(
+            name=name,
+            repo_root=repo_root,
+            repo_name=repo_root.name,
+            task=task,
+            logs_dir=get_logs_dir(),
+            model=model,
+            provider=provider,
+        )
+        click.echo(json.dumps(result))
+        return
+
     if task or continue_session:
-        # Background mode
+        # Local Docker background mode
         main_git = get_main_git_dir(repo_root)
         image = build_template_if_exists(repo_root)
         result = run_sandbox_background(
@@ -1092,6 +1377,8 @@ def start(name, continue_session, task, task_file, model, push, cleanup, provide
 @click.argument("name")
 def read(name):
     """Read results from a completed or running sandbox task."""
+    import re
+
     repo_root = get_repo_root()
     if not repo_root:
         click.echo("Not in a git repository", err=True)
@@ -1112,7 +1399,103 @@ def read(name):
             # Completed result — return as-is
             click.echo(json.dumps(data))
             return
-        # Running state file — try to recover
+
+        # Running state file — check runtime
+        if data.get("runtime") == "modal":
+            # Modal running state — reconnect or report gone
+            sandbox_id = data.get("sandboxId")
+            if not sandbox_id:
+                click.echo(json.dumps({"error": "Modal sandbox ID not recorded (sandbox may have not started)"}))
+                return
+            try:
+                import modal
+                from modal.exception import NotFoundError
+            except ImportError:
+                click.echo(json.dumps({"error": "modal package not installed. Run: pip install modal"}))
+                return
+            try:
+                modal_sb = modal.Sandbox.from_id(sandbox_id)
+            except NotFoundError:
+                click.echo(json.dumps({"error": f"Modal sandbox expired or not found: {sandbox_id}"}))
+                return
+
+            # Wait if still running
+            if modal_sb.poll() is None:
+                click.echo("Waiting for Modal sandbox to complete...", err=True)
+                modal_sb.wait()
+
+            # Read remaining stdout
+            log_raw = sb["log_raw"]
+            ansi_re = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]')
+            try:
+                remaining = modal_sb.stdout.read()
+            except Exception:
+                remaining = ""
+
+            # Append remaining output to log file
+            if remaining:
+                log_raw.parent.mkdir(parents=True, exist_ok=True)
+                with log_raw.open("a", encoding="utf-8") as f:
+                    f.write(remaining)
+
+            try:
+                exit_code = modal_sb.returncode if modal_sb.returncode is not None else modal_sb.wait()
+            except Exception:
+                exit_code = 1
+
+            try:
+                modal_sb.terminate(wait=True)
+            except Exception:
+                pass
+            try:
+                modal_sb.detach()
+            except Exception:
+                pass
+
+            # Parse __SANDBOX_RESULT__ from full log
+            full_log = log_raw.read_text(encoding="utf-8") if log_raw.exists() else ""
+            sandbox_result: dict = {}
+            for line in full_log.splitlines():
+                clean = ansi_re.sub("", line)
+                if clean.startswith("__SANDBOX_RESULT__"):
+                    payload = clean[len("__SANDBOX_RESULT__"):].strip()
+                    try:
+                        sandbox_result = json.loads(payload)
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+
+            provider_name = data.get("provider", "claude")
+            task_provider = get_provider(provider_name)
+            worktree_path = Path("/workspace")
+            response = task_provider["extract_response"](worktree_path, log_raw) if log_raw.exists() else None
+
+            result: dict = {
+                "name": data.get("name", safe_name(name)),
+                "branch": data.get("branch", name),
+                "runtime": "modal",
+                "provider": provider_name,
+                "exitCode": sandbox_result.get("exitCode", exit_code),
+                "modifiedFiles": sandbox_result.get("modifiedFiles", []),
+                "pushed": sandbox_result.get("pushed", False),
+            }
+            commit_sha = sandbox_result.get("commitSha", "")
+            if commit_sha:
+                result["commitSha"] = commit_sha
+            diff_stats = sandbox_result.get("diffStats")
+            if diff_stats:
+                result["diffStats"] = diff_stats
+            if response:
+                result["response"] = response
+            if exit_code != 0:
+                result["error"] = sandbox_result.get("error") or f"{provider_name} exited with code {exit_code}"
+            elif sandbox_result.get("error"):
+                result["error"] = sandbox_result["error"]
+
+            result_path.write_text(json.dumps(result))
+            click.echo(json.dumps(result))
+            return
+
+        # Docker running state
         base_commit = data.get("baseCommit", "")
         state_provider_name = data.get("provider", "claude")
         if not container_exists(container_name):

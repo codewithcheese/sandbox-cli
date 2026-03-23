@@ -9,3 +9,4 @@ build/
 venv/
 .idea/
 .claude/settings.local.json
+.env
