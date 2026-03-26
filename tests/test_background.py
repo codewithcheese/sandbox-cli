@@ -132,20 +132,20 @@ def _make_run_mock(overrides=None):
         if "docker wait" in cmd_str:
             return MagicMock(returncode=0, stdout="0\n")
         if "docker logs" in cmd_str:
-            return MagicMock(returncode=0, stdout='{"type": "result", "result": "All done."}\n')
+            return MagicMock(returncode=0, stdout='{"type": "result", "result": "All done."}\n', stderr="")
         if "status" in cmd_str and "--porcelain" in cmd_str:
             return MagicMock(returncode=0, stdout="M src/main.py\n")
         if "add" in cmd_str and "-A" in cmd_str:
-            return MagicMock(returncode=0, stdout="")
+            return MagicMock(returncode=0, stderr="", stdout="")
         if "commit" in cmd_str and "-m" in cmd_str:
-            return MagicMock(returncode=0, stdout="")
+            return MagicMock(returncode=0, stderr="", stdout="")
         if "push" in cmd_str and "origin" in cmd_str:
-            return MagicMock(returncode=0, stdout="")
+            return MagicMock(returncode=0, stderr="", stdout="")
         if "diff" in cmd_str and "--numstat" in cmd_str:
             return MagicMock(returncode=0, stdout="10\t2\tsrc/main.py\n")
         if "rev-parse" in cmd_str:
             return MagicMock(returncode=0, stdout="def456\n")
-        return MagicMock(returncode=0, stdout="")
+        return MagicMock(returncode=0, stderr="", stdout="")
     return side_effect
 
 
@@ -257,8 +257,8 @@ class TestLaunchFailureCleanup:
                 return MagicMock(returncode=1, stdout="", stderr="launch failed")
             if "branch" in cmd_str and "-D" in cmd_str:
                 branch_deleted.append(cmd)
-                return MagicMock(returncode=0, stdout="")
-            return MagicMock(returncode=0, stdout="")
+                return MagicMock(returncode=0, stderr="", stdout="")
+            return MagicMock(returncode=0, stderr="", stdout="")
 
         mock_run.side_effect = run_side_effect
 
@@ -383,7 +383,7 @@ class TestEnvExclusion:
             cmd_str = " ".join(cmd)
             if "reset" in cmd_str and ".env" in cmd_str:
                 reset_calls.append(cmd)
-                return MagicMock(returncode=0, stdout="")
+                return MagicMock(returncode=0, stderr="", stdout="")
             return _make_run_mock()(cmd, **kwargs)
 
         mock_run.side_effect = run_with_tracking

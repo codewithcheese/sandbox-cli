@@ -78,6 +78,7 @@ def resolve_sandbox(repo_root: Path, name: str, logs_dir: Path | None = None, re
         "worktree": get_worktree_path(repo_root, sname),
         "log_json": logs_dir / f"{container}.json",
         "log_raw": logs_dir / f"{container}.log",
+        "log_err": logs_dir / f"{container}.err",
     }
 
 
@@ -114,30 +115,29 @@ def extract_response(log_path: Path) -> str | None:
 
 
 def extract_codex_response(worktree_path: Path, log_path: Path) -> str | None:
-    """Extract response text from Codex output.
+    """Extract response text from Codex --json JSONL output.
 
-    1. Check if <worktree_path>/.sandbox-result.txt exists. If so, read and return its contents.
-    2. Fall back to reading log_path. Return the last non-empty, non-JSON line.
-    3. Return None if neither has content.
+    Finds the last agent_message item text from item.completed events.
+    worktree_path is accepted for interface consistency but not used.
     """
-    result_file = worktree_path / ".sandbox-result.txt"
-    if result_file.exists():
-        content = result_file.read_text().strip()
-        if content:
-            return content
+    if not log_path.exists():
+        return None
 
-    if log_path.exists():
-        for line in reversed(log_path.read_text().splitlines()):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                json.loads(line)
-                continue  # skip JSON lines
-            except (json.JSONDecodeError, ValueError):
-                return line
+    last_text = None
+    for line in log_path.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+            if (obj.get("type") == "item.completed"
+                    and isinstance(obj.get("item"), dict)
+                    and obj["item"].get("type") == "agent_message"):
+                last_text = obj["item"].get("text")
+        except (json.JSONDecodeError, ValueError):
+            continue
 
-    return None
+    return last_text
 
 
 def extract_gemini_response(worktree_path: Path, log_path: Path) -> str | None:
@@ -361,9 +361,12 @@ def ensure_default_image() -> str:
 
 def build_template_if_exists(repo_root: Path) -> str:
     """Build custom template if Dockerfile.sandbox exists, otherwise use default."""
+    # Always ensure default image exists (custom Dockerfiles may use FROM sandbox-cli:default)
+    ensure_default_image()
+
     dockerfile = repo_root / "Dockerfile.sandbox"
     if not dockerfile.exists():
-        return ensure_default_image()
+        return "sandbox-cli:default"
 
     image_name = f"sandbox-template:{repo_root.name}"
     with build_lock(_build_lock_path()):
@@ -421,8 +424,7 @@ def get_provider(name: str) -> dict:
         return {
             "name": "codex",
             "build_cmd": lambda task, model, worktree_path: [
-                "codex", "exec", "--yolo",
-                "-o", str(worktree_path / ".sandbox-result.txt"),
+                "codex", "exec", "--yolo", "--json",
                 *(["--model", model] if model else []),
                 task,
             ],
@@ -519,6 +521,7 @@ def run_sandbox_background(
     cleanup: bool = False,
     continue_session: bool = False,
     provider: str = "claude",
+    extra_mounts: list[str] | None = None,
 ) -> dict:
     """Run a sandbox task in background mode. Returns result dict."""
     sb = resolve_sandbox(repo_root, name, logs_dir=logs_dir, repo_name=repo_name)
@@ -615,6 +618,8 @@ def run_sandbox_background(
     ]
     for mount in task_provider["volume_mounts"](home):
         docker_cmd.extend(["-v", mount])
+    for mount in (extra_mounts or []):
+        docker_cmd.extend(["-v", mount])
     for env_var in task_provider["env_vars"]():
         docker_cmd.extend(["-e", env_var])
     docker_cmd.extend([
@@ -651,10 +656,11 @@ def _collect_and_finalize(sb: dict, exit_code: int, base_commit: str, repo_root:
     worktree_path = sb["worktree"]
     log_file = sb["log_json"]
 
-    # Save raw logs
+    # Save raw logs (stdout and stderr separately)
     log_result = run(["docker", "logs", container_name])
     sb["log_raw"].parent.mkdir(parents=True, exist_ok=True)
     sb["log_raw"].write_text(log_result.stdout)
+    sb["log_err"].write_text(log_result.stderr)
 
     # Commit
     commit_succeeded = False
@@ -702,6 +708,8 @@ def _collect_and_finalize(sb: dict, exit_code: int, base_commit: str, repo_root:
         "worktreePath": str(worktree_path),
         "modifiedFiles": modified_files,
         "provider": provider["name"],
+        "logPath": str(sb["log_raw"]),
+        "logErrPath": str(sb["log_err"]),
     }
 
     result["pushed"] = pushed
@@ -718,7 +726,7 @@ def _collect_and_finalize(sb: dict, exit_code: int, base_commit: str, repo_root:
         result["response"] = response
 
     if exit_code != 0:
-        result["error"] = f"{provider['name']} exited with code {exit_code}"
+        result["error"] = "Unknown error, check logErrPath for details"
 
     if not commit_succeeded and not nothing_to_commit:
         result["error"] = f"Commit failed, worktree preserved at {worktree_path}"
@@ -729,7 +737,7 @@ def _collect_and_finalize(sb: dict, exit_code: int, base_commit: str, repo_root:
     return result
 
 
-def run_sandbox(name: str, repo_name: str, main_git: Path, worktree_path: Path, template: str | None = None) -> None:
+def run_sandbox(name: str, repo_name: str, main_git: Path, worktree_path: Path, template: str | None = None, extra_mounts: list[str] | None = None) -> None:
     """Output sandbox run command for shell wrapper to execute."""
     home = Path.home()
     image = template or ensure_default_image()
@@ -767,6 +775,8 @@ def run_sandbox(name: str, repo_name: str, main_git: Path, worktree_path: Path, 
             "-v", f"{home}/.ssh:/home/agent/.ssh:ro",
             "-v", "pnpm-store:/pnpm-store",
         ]
+        for mount in (extra_mounts or []):
+            cmd_parts.extend(["-v", mount])
         # Add dynamic port mappings
         ports = find_available_ports(3)
         for port in ports:
@@ -808,6 +818,7 @@ COMMANDS:
            --task-file <path>      Read prompt from file (mutually exclusive with --task)
            --model <model>         Model to pass to the agent (e.g. haiku, sonnet, gpt-4.1)
            --provider <name>       Agent provider: claude (default), codex, or gemini (background only)
+           --mount <host:dst[:ro]> Extra volume mount, repeatable
            --push                  Push branch to origin after successful commit
            --cleanup               Remove worktree after completion
            Interactive: launches Docker container with Claude CLI
@@ -942,7 +953,9 @@ def auth(token):
 @click.option("--provider", "provider", default="claude",
               type=click.Choice(["claude", "codex", "gemini"]),
               help="Agent provider to use for background tasks (default: claude).")
-def start(name, continue_session, task, task_file, model, push, cleanup, provider):
+@click.option("--mount", "extra_mounts", multiple=True,
+              help="Extra volume mount (host:container[:ro]). Repeatable.")
+def start(name, continue_session, task, task_file, model, push, cleanup, provider, extra_mounts):
     """Start a sandbox (creates if new, resumes if exists)."""
     if continue_session and (task or task_file):
         click.echo("Cannot specify both --continue and --task/--task-file", err=True)
@@ -994,6 +1007,7 @@ def start(name, continue_session, task, task_file, model, push, cleanup, provide
             cleanup=cleanup,
             continue_session=continue_session,
             provider=provider,
+            extra_mounts=list(extra_mounts),
         )
         click.echo(json.dumps(result))
         return
@@ -1007,12 +1021,12 @@ def start(name, continue_session, task, task_file, model, push, cleanup, provide
         # Existing sandbox - resume session
         click.echo(f"Resuming sandbox: {sname}", err=True)
         template = build_template_if_exists(repo_root)
-        run_sandbox(sname, repo_name, main_git, worktree_path, template=template)
+        run_sandbox(sname, repo_name, main_git, worktree_path, template=template, extra_mounts=list(extra_mounts))
     elif worktree_path.exists():
         # Worktree exists but no sandbox - start fresh
         template = build_template_if_exists(repo_root)
         click.echo(f"Starting sandbox: {sname}", err=True)
-        run_sandbox(sname, repo_name, main_git, worktree_path, template=template)
+        run_sandbox(sname, repo_name, main_git, worktree_path, template=template, extra_mounts=list(extra_mounts))
     elif branch_exists(name):
         # Existing local branch - check if already in a worktree
         existing_wt = get_worktree_for_branch(name)
@@ -1036,7 +1050,7 @@ def start(name, continue_session, task, task_file, model, push, cleanup, provide
                 click.echo(f"Copied: {', '.join(copied)}", err=True)
 
             click.echo(f"Created sandbox from local branch: {name}", err=True)
-            run_sandbox(sname, repo_name, main_git, worktree_path, template=template)
+            run_sandbox(sname, repo_name, main_git, worktree_path, template=template, extra_mounts=list(extra_mounts))
     elif remote_branch_exists(name):
         # Existing remote branch - create worktree tracking it
         template = build_template_if_exists(repo_root)
@@ -1051,7 +1065,7 @@ def start(name, continue_session, task, task_file, model, push, cleanup, provide
             click.echo(f"Copied: {', '.join(copied)}", err=True)
 
         click.echo(f"Created sandbox from remote branch: {name}", err=True)
-        run_sandbox(sname, repo_name, main_git, worktree_path, template=template)
+        run_sandbox(sname, repo_name, main_git, worktree_path, template=template, extra_mounts=list(extra_mounts))
     else:
         # New sandbox with new branch
         # Pull latest changes before creating branch
@@ -1071,7 +1085,7 @@ def start(name, continue_session, task, task_file, model, push, cleanup, provide
             click.echo(f"Copied: {', '.join(copied)}", err=True)
 
         click.echo(f"Created sandbox: {sname}", err=True)
-        run_sandbox(sname, repo_name, main_git, worktree_path, template=template)
+        run_sandbox(sname, repo_name, main_git, worktree_path, template=template, extra_mounts=list(extra_mounts))
 
 
 @cli.command()
@@ -1210,7 +1224,7 @@ def rm(name, remove_all, force, yes):
 
     # Remove log files
     removed_logs = False
-    for log_path in (sb["log_json"], sb["log_raw"]):
+    for log_path in (sb["log_json"], sb["log_raw"], sb["log_err"]):
         if log_path.exists():
             log_path.unlink()
             removed_logs = True
@@ -1388,6 +1402,7 @@ def post_exit(name, repo_name):
 DOCS = {
     "prompt-guide": "How to write sandbox task prompts",
     "operations-guide": "Running sandboxes, integrating results, failure modes",
+    "dockerfile": "Built-in Dockerfile (reference for Dockerfile.sandbox)",
 }
 
 
@@ -1406,11 +1421,14 @@ def docs(name):
         click.echo(f"Unknown guide: {name}", err=True)
         click.echo(f"Available: {', '.join(DOCS.keys())}", err=True)
         sys.exit(1)
-    doc_path = docs_dir / f"{name}.md"
+    if name == "dockerfile":
+        doc_path = Path(__file__).parent / "Dockerfile"
+    else:
+        doc_path = docs_dir / f"{name}.md"
     if not doc_path.exists():
         click.echo(f"Guide file not found: {doc_path}", err=True)
         sys.exit(1)
-    click.echo_via_pager(doc_path.read_text())
+    click.echo(doc_path.read_text())
 
 
 if __name__ == "__main__":

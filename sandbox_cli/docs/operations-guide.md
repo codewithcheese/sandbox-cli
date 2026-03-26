@@ -4,53 +4,7 @@ How to write tasks, run sandboxes, integrate results, and avoid the failure mode
 
 ## Writing Task Prompts
 
-See `docs/tasks/claude-sandbox-prototype-authoring-guide.md` for the template and authoring rules. This section covers what we learned applying it.
-
-### Default workflow
-
-1. Write or update the design spec first.
-2. Write the sandbox task as a thin execution wrapper around that spec.
-3. Keep the task prompt focused on sandbox operation: what to read, what not to do, how to verify, what counts as blocked, and what artifacts to leave behind.
-
-If the task prompt starts looking like a second design doc, stop and move that material back into the spec.
-
-### What works
-
-- **A current design spec as source of truth.** The spec should own architecture, behavior, data shape, and detailed decisions. If that material already lives in the spec, do not restate it in the task prompt.
-- **Thin task wrappers.** The best task files tell the agent how to operate in the sandbox, not how to redesign the feature.
-- **Outcome-focused acceptance criteria.** "The editor renders markdown with headings, bold, and lists" beats "Create a PlateEditorRoot.tsx with MarkdownPlugin." Let the agent decide implementation.
-- **Explicit scope boundaries.** "No canvas integration, no agent SDK" prevents scope creep. Sandbox agents will build whatever you don't exclude.
-- **Execution-critical project context.** Svelte 5 runes mode, pnpm, vitest config details, adapter-node. Without these, the agent wastes time discovering them or writes Svelte 4 code. Keep this section short.
-- **Source-of-truth references plus a few targeted files.** Pointing to the spec and exact files prevents the agent from guessing at patterns that already exist in the codebase.
-- **Task-scoped decision artifacts.** `docs/task-runs/<task-slug>-decisions.md` instead of a shared `DECISIONS.md`. We had constant merge conflicts on DECISIONS.md because every sandbox wrote to the same file.
-
-### What doesn't work
-
-- **Duplicating the design spec inside the task prompt.** When the task restates architecture, schema details, long behavior descriptions, and file inventories, it gets noisy and drifts out of sync with the spec.
-- **Prescriptive implementation steps.** "Create file X with function Y using approach Z" makes the agent follow blindly rather than adapt. We got better results from "prove that X works" and letting the agent figure out how.
-- **Vague acceptance criteria.** "Works well" and "clean integration" are unverifiable. Every criterion must be something the agent can check with a command or assertion.
-- **Missing edge cases.** The agent will satisfy the happy path. If lifecycle cleanup, field preservation, round-trip fidelity, or error handling matter, name them explicitly in the criteria.
-- **Assuming the agent will question design decisions.** The agent implements what it's told. If you don't say "do not truncate data," it might add truncation as an optimization. If you don't say "do not filter elements," it might filter.
-
-### What belongs in the task prompt vs the design spec
-
-Put this in the design spec:
-
-- architecture
-- data model and schema rules
-- UX behavior and interaction rules
-- detailed file removal or migration lists
-- rationale for design choices
-
-Put this in the sandbox task prompt:
-
-- source-of-truth references
-- sandbox autonomy rules
-- blockers and environment prerequisites
-- scope guardrails
-- observable acceptance checks
-- verification commands
-- required output artifacts
+For the full template and authoring rules, run: `sandbox docs prompt-guide`
 
 ### Critical rule: No unspecified optimizations
 
@@ -73,6 +27,53 @@ sandbox start <name> --task-file docs/tasks/<task>.md --model sonnet --push
 - Use `--model sonnet` for implementation tasks (good balance of speed and quality)
 - Use `--model haiku` for simple/cheap tasks (quick tests, file listings)
 - Always run with `run_in_background` — sandboxes are designed to run as background tasks so you can continue working or launch multiple in parallel
+
+### Custom Docker image (Dockerfile.sandbox)
+
+If the default image is missing dependencies your project needs, add a `Dockerfile.sandbox` to the repo root. The sandbox CLI will build and use it automatically — no flags required.
+
+Use `FROM sandbox-cli:default` to extend the built-in image. The base image is always built first, so `FROM` just works.
+
+```dockerfile
+# Dockerfile.sandbox
+FROM sandbox-cli:default
+
+# Add project-specific system deps (as root)
+USER root
+RUN apt-get update && apt-get install -y postgresql-client && rm -rf /var/lib/apt/lists/*
+
+# Add project-specific global packages
+RUN npm install -g @prisma/cli
+
+# Switch back to agent user
+USER agent
+```
+
+The image is rebuilt every time you run `sandbox start`. The base image (`sandbox-cli:default`) includes node, git, gh CLI, claude/codex/gemini CLIs, playwright, pnpm, and the `agent` user.
+
+To view the built-in Dockerfile as a reference: `sandbox docs dockerfile`
+
+### Custom volume mounts
+
+Mount additional host directories into the container with `--mount`. Uses the same `host:container[:ro]` format as Docker's `-v` flag.
+
+```bash
+# Mount a shared fixtures directory (read-only)
+sandbox start <name> --task "..." --mount /data/fixtures:/fixtures:ro
+
+# Mount a local package for development
+sandbox start <name> --task "..." --mount /home/user/my-lib:/packages/my-lib
+
+# Multiple mounts
+sandbox start <name> --task "..." \
+  --mount /data/fixtures:/fixtures:ro \
+  --mount /home/user/my-lib:/packages/my-lib
+```
+
+Common uses:
+- Shared test fixtures or seed data too large to commit
+- Local packages under development that the task needs to import
+- Config or credential files beyond what the provider already mounts
 
 ### Parallel safety
 

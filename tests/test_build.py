@@ -37,7 +37,8 @@ def test_build_template_acquires_lock(mock_run, mock_lock, tmp_path):
     mock_run.return_value = MagicMock(returncode=0)
 
     build_template_if_exists(tmp_path)
-    mock_lock.assert_called_once()
+    # Called twice: once for ensure_default_image(), once for custom build
+    assert mock_lock.call_count == 2
 
 
 @patch("sandbox_cli._build_lock_path")

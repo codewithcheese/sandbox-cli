@@ -16,75 +16,63 @@ from sandbox_cli import extract_codex_response, extract_gemini_response, get_pro
 # ---------------------------------------------------------------------------
 
 class TestExtractCodexResponse:
-    """AC#10: extract_codex_response test cases."""
+    """extract_codex_response parses Codex --json JSONL event stream."""
 
-    def test_returns_file_contents_when_result_file_exists(self, tmp_path):
-        """(a) returns file contents when .sandbox-result.txt exists."""
-        worktree = tmp_path / "worktree"
-        worktree.mkdir()
-        result_file = worktree / ".sandbox-result.txt"
-        result_file.write_text("The agent completed the task successfully.")
-
-        log_path = tmp_path / "container.log"
-        log_path.write_text('{"type": "result", "result": "log output"}\n')
-
-        response = extract_codex_response(worktree, log_path)
-        assert response == "The agent completed the task successfully."
-
-    def test_returns_last_non_json_line_when_file_missing(self, tmp_path):
-        """(b) returns last non-empty non-JSON line from logs when file is missing."""
-        worktree = tmp_path / "worktree"
-        worktree.mkdir()
-        # No .sandbox-result.txt
-
+    def test_returns_last_agent_message(self, tmp_path):
+        """Returns text from last item.completed agent_message event."""
         log_path = tmp_path / "container.log"
         log_path.write_text(
-            '{"type": "info", "msg": "starting"}\n'
-            'Here is the final answer\n'
-            '{"type": "result", "result": "json result"}\n'
-            '\n'  # trailing empty line
+            '{"type":"item.completed","item":{"type":"agent_message","text":"First message"}}\n'
+            '{"type":"item.completed","item":{"type":"command_execution","exit_code":0}}\n'
+            '{"type":"item.completed","item":{"type":"agent_message","text":"Task done."}}\n'
+            '{"type":"turn.completed","usage":{"input_tokens":100}}\n'
         )
+        response = extract_codex_response(tmp_path / "worktree", log_path)
+        assert response == "Task done."
 
-        response = extract_codex_response(worktree, log_path)
-        # Last non-empty non-JSON line (scanning in reverse):
-        # '' (empty, skip), '{"type": "result", ...}' (JSON, skip), 'Here is the final answer' (return)
-        assert response == "Here is the final answer"
-
-    def test_returns_none_when_neither_source_has_content(self, tmp_path):
-        """(c) returns None when neither source has content."""
-        worktree = tmp_path / "worktree"
-        worktree.mkdir()
-        # No .sandbox-result.txt, log has only JSON/empty lines
-
+    def test_skips_non_agent_message_items(self, tmp_path):
+        """Ignores item.completed events that are not agent_message type."""
         log_path = tmp_path / "container.log"
         log_path.write_text(
-            '{"type": "info", "msg": "starting"}\n'
-            '{"type": "result", "result": "done"}\n'
+            '{"type":"item.completed","item":{"type":"command_execution","exit_code":0}}\n'
+            '{"type":"item.completed","item":{"type":"agent_message","text":"Done"}}\n'
         )
+        response = extract_codex_response(tmp_path / "worktree", log_path)
+        assert response == "Done"
 
-        response = extract_codex_response(worktree, log_path)
-        assert response is None
-
-    def test_returns_none_when_log_missing_and_no_result_file(self, tmp_path):
-        """Returns None when log file doesn't exist and no result file."""
-        worktree = tmp_path / "worktree"
-        worktree.mkdir()
-        log_path = tmp_path / "nonexistent.log"
-
-        response = extract_codex_response(worktree, log_path)
-        assert response is None
-
-    def test_empty_result_file_falls_back_to_log(self, tmp_path):
-        """Empty .sandbox-result.txt falls back to log file."""
-        worktree = tmp_path / "worktree"
-        worktree.mkdir()
-        (worktree / ".sandbox-result.txt").write_text("   \n  ")  # whitespace only
-
+    def test_returns_none_when_no_agent_message(self, tmp_path):
+        """Returns None when log has no agent_message events."""
         log_path = tmp_path / "container.log"
-        log_path.write_text("plain text response\n")
+        log_path.write_text(
+            '{"type":"item.completed","item":{"type":"command_execution","exit_code":0}}\n'
+            '{"type":"turn.completed","usage":{"input_tokens":100}}\n'
+        )
+        response = extract_codex_response(tmp_path / "worktree", log_path)
+        assert response is None
 
-        response = extract_codex_response(worktree, log_path)
-        assert response == "plain text response"
+    def test_returns_none_when_log_missing(self, tmp_path):
+        """Returns None when log file does not exist."""
+        response = extract_codex_response(tmp_path / "worktree", tmp_path / "nonexistent.log")
+        assert response is None
+
+    def test_skips_malformed_lines(self, tmp_path):
+        """Skips malformed/non-JSON lines gracefully."""
+        log_path = tmp_path / "container.log"
+        log_path.write_text(
+            'not json\n'
+            '{"type":"item.completed","item":{"type":"agent_message","text":"Result"}}\n'
+        )
+        response = extract_codex_response(tmp_path / "worktree", log_path)
+        assert response == "Result"
+
+    def test_worktree_path_not_used(self, tmp_path):
+        """worktree_path parameter is accepted but not used."""
+        log_path = tmp_path / "container.log"
+        log_path.write_text(
+            '{"type":"item.completed","item":{"type":"agent_message","text":"Done"}}\n'
+        )
+        response = extract_codex_response(Path("/nonexistent/worktree"), log_path)
+        assert response == "Done"
 
 
 # ---------------------------------------------------------------------------
@@ -123,15 +111,14 @@ class TestGetProvider:
         assert "sonnet" in cmd
 
     def test_codex_build_cmd_basic(self, tmp_path):
-        """AC#1: Codex build_cmd uses codex exec --yolo -o <path> <task>."""
+        """Codex build_cmd uses codex exec --yolo --json <task>."""
         provider = get_provider("codex")
         cmd = provider["build_cmd"]("hello", None, tmp_path)
         assert cmd[0] == "codex"
         assert "exec" in cmd
         assert "--yolo" in cmd
-        assert "-o" in cmd
-        o_idx = cmd.index("-o")
-        assert cmd[o_idx + 1] == str(tmp_path / ".sandbox-result.txt")
+        assert "--json" in cmd
+        assert "-o" not in cmd
         assert "hello" in cmd
 
     def test_codex_build_cmd_with_model(self, tmp_path):
@@ -345,16 +332,16 @@ class TestStateFileProvider:
             if "docker wait" in cmd_str:
                 return MagicMock(returncode=0, stdout="0\n")
             if "docker logs" in cmd_str:
-                return MagicMock(returncode=0, stdout='{"type": "result", "result": "done"}\n')
+                return MagicMock(returncode=0, stderr="", stdout='{"type": "result", "result": "done"}\n')
             if "status" in cmd_str and "--porcelain" in cmd_str:
-                return MagicMock(returncode=0, stdout="")
+                return MagicMock(returncode=0, stderr="", stdout="")
             if "add" in cmd_str and "-A" in cmd_str:
-                return MagicMock(returncode=0, stdout="")
+                return MagicMock(returncode=0, stderr="", stdout="")
             if "reset" in cmd_str:
-                return MagicMock(returncode=0, stdout="")
+                return MagicMock(returncode=0, stderr="", stdout="")
             if "rev-parse" in cmd_str:
                 return MagicMock(returncode=0, stdout="def456\n")
-            return MagicMock(returncode=0, stdout="")
+            return MagicMock(returncode=0, stderr="", stdout="")
 
         mock_run.side_effect = run_side_effect
 
@@ -395,16 +382,16 @@ class TestStateFileProvider:
             if "docker wait" in cmd_str:
                 return MagicMock(returncode=0, stdout="0\n")
             if "docker logs" in cmd_str:
-                return MagicMock(returncode=0, stdout='{"type": "result", "result": "done"}\n')
+                return MagicMock(returncode=0, stderr="", stdout='{"type": "result", "result": "done"}\n')
             if "status" in cmd_str and "--porcelain" in cmd_str:
-                return MagicMock(returncode=0, stdout="")
+                return MagicMock(returncode=0, stderr="", stdout="")
             if "add" in cmd_str and "-A" in cmd_str:
-                return MagicMock(returncode=0, stdout="")
+                return MagicMock(returncode=0, stderr="", stdout="")
             if "reset" in cmd_str:
-                return MagicMock(returncode=0, stdout="")
+                return MagicMock(returncode=0, stderr="", stdout="")
             if "rev-parse" in cmd_str:
                 return MagicMock(returncode=0, stdout="def456\n")
-            return MagicMock(returncode=0, stdout="")
+            return MagicMock(returncode=0, stderr="", stdout="")
 
         mock_run.side_effect = run_side_effect
 
@@ -465,16 +452,16 @@ class TestReadCommandProvider:
         def run_side_effect(cmd, **kwargs):
             cmd_str = " ".join(cmd)
             if "docker logs" in cmd_str:
-                return MagicMock(returncode=0, stdout='{"type": "result", "result": "done"}\n')
+                return MagicMock(returncode=0, stderr="", stdout='{"type": "result", "result": "done"}\n')
             if "docker inspect" in cmd_str and "ExitCode" in cmd_str:
                 return MagicMock(returncode=0, stdout="0\n")
             if "status" in cmd_str and "--porcelain" in cmd_str:
-                return MagicMock(returncode=0, stdout="")
+                return MagicMock(returncode=0, stderr="", stdout="")
             if "add" in cmd_str:
-                return MagicMock(returncode=0, stdout="")
+                return MagicMock(returncode=0, stderr="", stdout="")
             if "reset" in cmd_str:
-                return MagicMock(returncode=0, stdout="")
-            return MagicMock(returncode=0, stdout="")
+                return MagicMock(returncode=0, stderr="", stdout="")
+            return MagicMock(returncode=0, stderr="", stdout="")
 
         mock_run.side_effect = run_side_effect
 
@@ -568,14 +555,14 @@ class TestProviderErrorMessage:
             if "docker wait" in cmd_str:
                 return MagicMock(returncode=0, stdout="1\n")  # exit code 1
             if "docker logs" in cmd_str:
-                return MagicMock(returncode=0, stdout="")
+                return MagicMock(returncode=0, stderr="", stdout="")
             if "status" in cmd_str and "--porcelain" in cmd_str:
-                return MagicMock(returncode=0, stdout="")
+                return MagicMock(returncode=0, stderr="", stdout="")
             if "add" in cmd_str:
-                return MagicMock(returncode=0, stdout="")
+                return MagicMock(returncode=0, stderr="", stdout="")
             if "reset" in cmd_str:
-                return MagicMock(returncode=0, stdout="")
-            return MagicMock(returncode=0, stdout="")
+                return MagicMock(returncode=0, stderr="", stdout="")
+            return MagicMock(returncode=0, stderr="", stdout="")
 
         mock_run.side_effect = run_side_effect
 
@@ -587,8 +574,7 @@ class TestProviderErrorMessage:
         )
 
         assert "error" in result
-        assert "claude" in result["error"].lower()
-        assert "1" in result["error"]
+        assert "logErrPath" in result["error"]
 
 
 # ---------------------------------------------------------------------------
@@ -872,14 +858,14 @@ class TestGeminiCLI:
                 if "docker wait" in cmd_str:
                     return MagicMock(returncode=0, stdout="1\n")
                 if "docker logs" in cmd_str:
-                    return MagicMock(returncode=0, stdout="")
+                    return MagicMock(returncode=0, stderr="", stdout="")
                 if "status" in cmd_str and "--porcelain" in cmd_str:
-                    return MagicMock(returncode=0, stdout="")
+                    return MagicMock(returncode=0, stderr="", stdout="")
                 if "add" in cmd_str:
-                    return MagicMock(returncode=0, stdout="")
+                    return MagicMock(returncode=0, stderr="", stdout="")
                 if "reset" in cmd_str:
-                    return MagicMock(returncode=0, stdout="")
-                return MagicMock(returncode=0, stdout="")
+                    return MagicMock(returncode=0, stderr="", stdout="")
+                return MagicMock(returncode=0, stderr="", stdout="")
 
             mock_run.side_effect = run_side_effect
             with patch("sandbox_cli.get_gh_token", return_value="tok"):
@@ -891,8 +877,7 @@ class TestGeminiCLI:
                 )
 
         assert "error" in result
-        assert "gemini" in result["error"].lower()
-        assert "1" in result["error"]
+        assert "logErrPath" in result["error"]
 
     def test_gemini_state_includes_provider(self, tmp_path):
         """AC#9: state file includes 'provider': 'gemini'."""
@@ -923,16 +908,16 @@ class TestGeminiCLI:
                 if "docker wait" in cmd_str:
                     return MagicMock(returncode=0, stdout="0\n")
                 if "docker logs" in cmd_str:
-                    return MagicMock(returncode=0, stdout='{"response": "done"}\n')
+                    return MagicMock(returncode=0, stderr="", stdout='{"response": "done"}\n')
                 if "status" in cmd_str and "--porcelain" in cmd_str:
-                    return MagicMock(returncode=0, stdout="")
+                    return MagicMock(returncode=0, stderr="", stdout="")
                 if "add" in cmd_str:
-                    return MagicMock(returncode=0, stdout="")
+                    return MagicMock(returncode=0, stderr="", stdout="")
                 if "reset" in cmd_str:
-                    return MagicMock(returncode=0, stdout="")
+                    return MagicMock(returncode=0, stderr="", stdout="")
                 if "rev-parse" in cmd_str:
                     return MagicMock(returncode=0, stdout="def456\n")
-                return MagicMock(returncode=0, stdout="")
+                return MagicMock(returncode=0, stderr="", stdout="")
 
             mock_run.side_effect = run_side_effect
             with patch("sandbox_cli.get_gh_token", return_value="tok"):

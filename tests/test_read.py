@@ -102,7 +102,7 @@ def test_recovery_from_exited_container_commits_and_cleans_up(
     def run_side_effect(cmd, **kwargs):
         cmd_str = " ".join(cmd)
         if "docker logs" in cmd_str:
-            return MagicMock(returncode=0, stdout='{"type": "result", "result": "Recovered."}\n')
+            return MagicMock(returncode=0, stderr="", stdout='{"type": "result", "result": "Recovered."}\n')
         if "docker wait" in cmd_str:
             return MagicMock(returncode=0, stdout="0\n")
         if "docker inspect" in cmd_str and "ExitCode" in cmd_str:
@@ -110,18 +110,18 @@ def test_recovery_from_exited_container_commits_and_cleans_up(
         if "status" in cmd_str and "--porcelain" in cmd_str:
             return MagicMock(returncode=0, stdout="M file.py\n")
         if "add" in cmd_str and "-A" in cmd_str:
-            return MagicMock(returncode=0, stdout="")
+            return MagicMock(returncode=0, stderr="", stdout="")
         if "reset" in cmd_str and ".env" in cmd_str:
-            return MagicMock(returncode=0, stdout="")
+            return MagicMock(returncode=0, stderr="", stdout="")
         if "commit" in cmd_str and "-m" in cmd_str:
-            return MagicMock(returncode=0, stdout="")
+            return MagicMock(returncode=0, stderr="", stdout="")
         if "push" in cmd_str and "origin" in cmd_str:
-            return MagicMock(returncode=0, stdout="")
+            return MagicMock(returncode=0, stderr="", stdout="")
         if "diff" in cmd_str and "--numstat" in cmd_str:
             return MagicMock(returncode=0, stdout="10\t2\tfile.py\n")
         if "rev-parse" in cmd_str:
             return MagicMock(returncode=0, stdout="def456\n")
-        return MagicMock(returncode=0, stdout="")
+        return MagicMock(returncode=0, stderr="", stdout="")
 
     mock_run.side_effect = run_side_effect
 

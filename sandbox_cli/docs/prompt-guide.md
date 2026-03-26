@@ -1,23 +1,10 @@
-# Claude Sandbox Prototype Prompt Authoring Guide
+# Sandbox Task Prompt Authoring Guide
 
-Use this guide to write autonomous prototype-task prompts for Claude running via the local `sandbox` CLI.
+Use this guide to write autonomous task prompts for agents running via the local `sandbox` CLI.
 
-It is optimized for tasks where Claude is expected to inspect the repo, install or adapt dependencies, debug through failures, run verification commands, and keep going until the acceptance criteria are actually met.
+It is optimized for implementation-heavy tasks where the agent inspects the repo, debugs through failures, and keeps going until acceptance criteria are met. Not for pure research, code review, or planning-only work.
 
-The default pattern is: keep the design in a spec, and keep the task prompt focused on how Claude should operate inside the sandbox.
-
-## When to use this guide
-
-Use this template when the task is primarily:
-
-- building a prototype or proof of concept
-- validating an integration risk
-- adapting a library or tool into the current app
-- creating a narrow experimental slice with real verification
-
-Do not use this as-is for pure research, code review, or planning-only work. The autonomy and completion language here is tuned for implementation-heavy tasks.
-
-It works best when the task already has a current design spec. In that case, the task prompt should be a thin execution wrapper around the spec, not a second design document.
+The default pattern is: keep the design in a spec, and keep the task prompt focused on how the agent should operate inside the sandbox.
 
 ## Default operating model: spec first, task prompt second
 
@@ -28,30 +15,7 @@ When a current design spec already exists, use this split:
 - acceptance criteria prove that the implementation satisfies the spec; they do not need to restate the entire spec
 - only repeat a design detail in the task prompt if it is easy for the agent to miss or violate
 
-This keeps task files shorter, clearer, and less self-contradictory.
-
 If no design spec exists yet, either write one first or accept that the task prompt will need to carry more design detail than usual.
-
-## Why this works for Claude in sandbox
-
-Claude does best when the prompt gives it a clear finish line, permission to decide locally, and instructions to trust observed reality over stale assumptions.
-
-Claude is strong at:
-
-- exploring the codebase and local environment
-- iterating from command output and runtime evidence
-- adapting to real package APIs and version drift
-- pushing through normal debugging friction when the prompt tells it to
-
-Claude is weaker when prompts are vague. It may:
-
-- stop at "probably done" if the acceptance criteria are soft
-- treat background notes as requirements if priorities are blurred
-- over-invest in the first plausible approach
-- miss lifecycle, cleanup, and round-trip edge cases unless they are explicit
-- under-document tradeoffs or surprises unless asked to leave artifacts
-
-This guide is designed to counter those failure modes directly.
 
 ## Authoring rules
 
@@ -156,10 +120,6 @@ Treat Claude as blocked only when progress requires something it cannot obtain o
 
 Keep the filled prompt concrete and compact.
 
-### `Task`
-
-Use a short task title and one sentence on the purpose of the prototype.
-
 ### `Goal`
 
 Describe the intended result in one to three sentences. Focus on what the sandbox run must prove or deliver, not the full design.
@@ -178,7 +138,7 @@ Say what should not be built. This is one of the easiest ways to prevent scope c
 
 ### `Acceptance criteria`
 
-Use a numbered list. Each item should describe an observable behavior, artifact, or command result.
+Each item should describe an observable behavior, artifact, or command result.
 
 ### `Autonomy contract`
 
@@ -203,15 +163,7 @@ Do not use this section to copy architecture or product behavior already defined
 
 ### `Environment prerequisites`
 
-List external conditions that must already be true or available, for example:
-
-- authenticated CLIs
-- network access
-- required external services
-- expected environment variables
-- seeded files, data, or credentials
-
-If there are no such prerequisites, write `None`.
+External conditions that must be in place before the task starts (authenticated CLIs, network access, env vars, etc.). If none, write `None`.
 
 ### `Known decisions / invariants`
 
