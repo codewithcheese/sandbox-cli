@@ -11,6 +11,9 @@ dependencies = [
 [project.scripts]
 sandbox = "sandbox_cli:cli"
 
+[tool.setuptools.packages.find]
+include = ["sandbox_cli*"]
+
 [tool.setuptools.package-data]
 sandbox_cli = ["Dockerfile", "scripts/*", "docs/*.md"]
 
